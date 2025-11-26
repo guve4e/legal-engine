@@ -7,11 +7,12 @@ async function bootstrap() {
   app.enableCors({
     origin: [
       'http://localhost:5173',
-      'http://127.0.0.1:5173',
+      'http://localhost',
+      'https://aiadvocate.ddns.net',
+      'https://legal-engine.ddns.net'
     ],
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-    allowedHeaders: 'Content-Type,Authorization',
-    credentials: false,
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    credentials: true,
   });
 
   await app.listen(3000);
