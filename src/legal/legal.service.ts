@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import {
@@ -10,67 +10,41 @@ import {
   LegalPassageDocument,
 } from './schemas/legal-passage.schema';
 import { AiService } from '../ai/ai.service';
+import { Pool } from 'pg';
+import { EmbeddingsService } from './embeddings.service';
+import { toSql } from 'pgvector';
+import { PgLegalRepository } from '../pg/pg-legal.repository';
+
+interface LawChunkRow {
+  id: number;
+  law_id: number;
+  chunk_index: number;
+  chunk_text: string;
+  law_title: string;
+  list_title: string;
+  source_url: string;
+}
 
 @Injectable()
 export class LegalService {
   constructor(
     @InjectModel(LegalSource.name)
     private readonly legalSourceModel: Model<LegalSourceDocument>,
+
     @InjectModel(LegalPassage.name)
     private readonly legalPassageModel: Model<LegalPassageDocument>,
-    private readonly aiService: AiService,
-  ) {}
 
+    private readonly aiService: AiService,
+
+    @Inject('PG_POOL')
+    private readonly pgPool: Pool,
+
+    private readonly embeddingsService: EmbeddingsService,
+
+    private readonly pgLegalRepo: PgLegalRepository,
+  ) {}
   ping() {
     return 'Legal service with Mongo is responsive';
-  }
-
-  async seedDemoData() {
-    // Check if we already seeded:
-    const existing = await this.legalSourceModel.findOne({ code: 'KTK' });
-    if (existing) {
-      return { message: 'Demo data already exists', sourceId: existing._id };
-    }
-
-    const source = await this.legalSourceModel.create({
-      code: 'KTK',
-      titleBg: 'Кодекс на търговското корабоплаване',
-      jurisdiction: 'BG',
-      domains: ['boat', 'river', 'sea'],
-      notes: 'Демо източник за тестване.',
-    });
-
-    const passage = await this.legalPassageModel.create({
-      sourceId: source._id,
-      contentType: 'law',
-      language: 'bg',
-      article: '89',
-      paragraph: '1',
-      citation: 'Чл. 89, ал. 1 КТК',
-      text: 'На капитана на кораба се възлага управлението на кораба, включително и корабоводенето, както и вземането на всички необходими мерки за безопасно плаване и поддържане на реда в кораба.',
-      domains: ['boat', 'river', 'sea'],
-      tags: ['captain', 'documents', 'responsibility'],
-      chunkIndex: 0,
-      chunkCount: 1,
-      importance: 0.9,
-    });
-
-    return {
-      message: 'Demo legal source and passage created',
-      sourceId: source._id,
-      passageId: passage._id,
-    };
-  }
-
-  async getAllSources() {
-    return this.legalSourceModel.find().lean();
-  }
-
-  async getPassagesByDomain(domain: string) {
-    return this.legalPassageModel
-      .find({ domains: domain })
-      .limit(20)
-      .lean();
   }
 
   async searchPassages(query: string, domain?: string) {
@@ -93,12 +67,11 @@ export class LegalService {
   }
 
   async chat(question: string, domain?: string, limit = 5) {
-    const passages = await this.searchPassages(question, domain);
-    const limitedPassages = passages.slice(0, limit);
+    const passages = await this.getPassagesForChat(question, domain, limit);
 
     const aiAnswer = await this.aiService.generateAnswer(
       question,
-      limitedPassages.map((p) => ({
+      passages.map((p) => ({
         citation: p.citation,
         text: p.text,
       })),
@@ -107,8 +80,8 @@ export class LegalService {
     return {
       question,
       domain: domain ?? null,
-      contextCount: limitedPassages.length,
-      context: limitedPassages.map((p) => ({
+      contextCount: passages.length,
+      context: passages.map((p) => ({
         citation: p.citation,
         article: p.article,
         paragraph: p.paragraph,
@@ -117,6 +90,75 @@ export class LegalService {
         domains: p.domains,
         id: p._id,
       })),
+      answer: aiAnswer,
+    };
+  }
+
+  async getPassagesForChat(
+    question: string,
+    domain?: string,
+    limit = 5,
+  ) {
+    // 1) try search by question text + domain
+    let passages = await this.searchPassages(question, domain);
+
+    // 2) if nothing found and domain is given → fallback to domain only
+    if ((!passages || passages.length === 0) && domain) {
+      passages = await this.legalPassageModel
+        .find({ domains: domain })
+        .sort({ importance: -1, createdAt: 1 })
+        .limit(limit)
+        .lean();
+    }
+
+    // 3) if still nothing, just return empty array
+    return passages.slice(0, limit);
+  }
+
+  async pgHealth() {
+    const res = await this.pgPool.query('SELECT COUNT(*)::int AS count FROM laws;');
+    return {
+      message: 'Postgres legal DB is reachable',
+      laws: res.rows[0].count,
+    };
+  }
+
+  private async searchLawChunksByQuestion(
+    question: string,
+    limit = 10,
+    lawId?: number,
+  ): Promise<LawChunkRow[]> {
+    const embedding = await this.embeddingsService.embed(question);
+    return this.pgLegalRepo.findChunksByEmbedding(embedding, limit, lawId);
+  }
+
+  async pgStats() {
+    const stats = await this.pgLegalRepo.getStats();
+    return {
+      message: 'Postgres legal DB is reachable',
+      ...stats,
+    };
+  }
+
+  async listPgLaws() {
+    return this.pgLegalRepo.listLaws();
+  }
+
+  async chatWithPg(question: string, limit = 5, lawId?: number) {
+    const chunks = await this.searchLawChunksByQuestion(question, limit, lawId);
+
+    const aiAnswer = await this.aiService.generateAnswer(
+      question,
+      chunks.map((c) => ({
+        citation: `${c.law_title} (ldoc: ${c.law_id}, chunk ${c.chunk_index})`,
+        text: c.chunk_text,
+      })),
+    );
+
+    return {
+      question,
+      contextCount: chunks.length,
+      context: chunks,
       answer: aiAnswer,
     };
   }

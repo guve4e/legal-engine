@@ -1,8 +1,10 @@
-// src/legal/legal.module.ts
 import { Module } from '@nestjs/common';
 import { LegalController } from './legal.controller';
 import { LegalService } from './legal.service';
 import { MongooseModule } from '@nestjs/mongoose';
+import { EmbeddingsService } from './embeddings.service';
+import { PgLegalRepository } from '../pg/pg-legal.repository';
+
 import {
   LegalSource,
   LegalSourceSchema,
@@ -22,7 +24,7 @@ import { AiModule } from '../ai/ai.module';
     AiModule,
   ],
   controllers: [LegalController],
-  providers: [LegalService],
-  exports: [LegalService],
+  providers: [LegalService, EmbeddingsService, PgLegalRepository],
+  exports: [LegalService, PgLegalRepository],
 })
 export class LegalModule {}
