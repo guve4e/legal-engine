@@ -1,3 +1,4 @@
+// src/legal/legal.service.ts
 import { Inject, Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
@@ -12,7 +13,6 @@ import {
 import { AiService } from '../ai/ai.service';
 import { Pool } from 'pg';
 import { EmbeddingsService } from './embeddings.service';
-import { toSql } from 'pgvector';
 import { PgLegalRepository } from '../pg/pg-legal.repository';
 
 interface LawChunkRow {
@@ -43,6 +43,7 @@ export class LegalService {
 
     private readonly pgLegalRepo: PgLegalRepository,
   ) {}
+
   ping() {
     return 'Legal service with Mongo is responsive';
   }
@@ -60,10 +61,7 @@ export class LegalService {
       filter.$or = [{ text: regex }, { tags: regex }, { citation: regex }];
     }
 
-    return this.legalPassageModel
-      .find(filter)
-      .limit(20)
-      .lean();
+    return this.legalPassageModel.find(filter).limit(20).lean();
   }
 
   async chat(question: string, domain?: string, limit = 5) {
@@ -116,19 +114,32 @@ export class LegalService {
   }
 
   async pgHealth() {
-    const res = await this.pgPool.query('SELECT COUNT(*)::int AS count FROM laws;');
+    const res = await this.pgPool.query(
+      'SELECT COUNT(*)::int AS count FROM laws;',
+    );
     return {
       message: 'Postgres legal DB is reachable',
       laws: res.rows[0].count,
     };
   }
 
+  /**
+   * INTERNAL: run vector search over Postgres chunks.
+   * Now uses AI to rewrite the user question into a better search query
+   * before creating the embedding.
+   */
   private async searchLawChunksByQuestion(
     question: string,
     limit = 10,
     lawId?: number,
   ): Promise<LawChunkRow[]> {
-    const embedding = await this.embeddingsService.embed(question);
+    // 🔎 Step 1: rewrite the question into a legal search query
+    const rewritten = await this.aiService.rewriteLegalSearchQuery(question);
+
+    // 🧬 Step 2: embed the rewritten query (fallback is the original)
+    const embedding = await this.embeddingsService.embed(rewritten);
+
+    // 🔍 Step 3: vector search in Postgres
     return this.pgLegalRepo.findChunksByEmbedding(embedding, limit, lawId);
   }
 
@@ -145,7 +156,11 @@ export class LegalService {
   }
 
   async chatWithPg(question: string, limit = 5, lawId?: number) {
-    const chunks = await this.searchLawChunksByQuestion(question, limit, lawId);
+    const chunks = await this.searchLawChunksByQuestion(
+      question,
+      limit,
+      lawId,
+    );
 
     const aiAnswer = await this.aiService.generateAnswer(
       question,
