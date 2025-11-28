@@ -1,11 +1,15 @@
 import { Body, Controller, Get, Post } from '@nestjs/common';
-import { LegalService } from './legal.service';
+import { LegalService, Tier } from './legal.service';
 import { ChatDto } from './dto/chat.dto';
 import { ChatPgDto } from './dto/chat-pg.dto';
+import { AiService } from '../ai/ai.service';
 
 @Controller('legal')
 export class LegalController {
-  constructor(private readonly legalService: LegalService) {}
+  constructor(
+    private readonly legalService: LegalService,
+    private readonly aiService: AiService,
+  ) {}
 
   // -------------------------------------------------------
   // Mongo
@@ -41,9 +45,21 @@ export class LegalController {
     return this.legalService.listPgLaws();
   }
 
+  @Post('debug/analyze-question')
+  async debugAnalyze(@Body() body: { question: string }) {
+    const { question } = body;
+    return this.aiService.analyzeLegalQuestion(question);
+  }
+
+
   @Post('chat-pg')
   async chatPg(@Body() body: ChatPgDto): Promise<any> {
-    const { question, limit = 5, lawId } = body;
-    return this.legalService.chatWithPg(question, limit, lawId);
+    const { question } = body;
+
+    // Backend decides tier, user just asks the question
+    const tier: Tier =
+      (process.env.AIADVOCATE_FORCE_TIER as Tier) ?? 'free';
+
+    return this.legalService.chatWithPg(question, { tier });
   }
 }

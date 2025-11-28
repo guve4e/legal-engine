@@ -19,6 +19,8 @@ export interface LawChunkRow {
   law_title: string;
   list_title: string;
   source_url: string;
+  ldoc_id: string;
+  score: number; // smaller = closer (pgvector <=>)
 }
 
 @Injectable()
@@ -63,7 +65,7 @@ export class PgLegalRepository {
   /**
    * Vector similarity search over law_chunks with optional filter by law_id.
    *
-   * @param embedding numerical embedding (1536-dim)
+   * @param embedding numerical embedding (same dim as pgvector column)
    * @param limit max rows to return
    * @param lawId optional law_id filter
    */
@@ -72,7 +74,6 @@ export class PgLegalRepository {
     limit = 10,
     lawId?: number,
   ): Promise<LawChunkRow[]> {
-    // toSql converts JS array -> pgvector literal string: '[0.12, -0.34, ...]'
     const embeddingLiteral = toSql(embedding);
 
     const params: any[] = [embeddingLiteral, limit];
@@ -90,7 +91,9 @@ export class PgLegalRepository {
         lc.chunk_text,
         l.law_title,
         l.list_title,
-        l.source_url
+        l.source_url,
+        l.ldoc_id,
+        (lc.embedding <=> $1::vector) AS score
       FROM law_chunks lc
       JOIN laws l ON l.id = lc.law_id
       ${whereClause}

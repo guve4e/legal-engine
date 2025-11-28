@@ -1,20 +1,28 @@
 // src/ai/ai.service.ts
 import { Injectable, Logger } from '@nestjs/common';
-import { HttpService } from '@nestjs/axios';
-import { firstValueFrom } from 'rxjs';
+import { OpenAI } from 'openai';
 
 export interface AiContextItem {
   citation?: string;
   text: string;
 }
 
+/**
+ * Result of analyzing a Bulgarian legal question.
+ * - domains: high-level categories (traffic, police, labor, tax, consumer, family, criminal, other)
+ * - lawHints: Bulgarian names of relevant laws/codes (e.g. "Закон за движението по пътищата")
+ */
+export interface LegalQuestionAnalysis {
+  domains: string[];
+  lawHints: string[];
+}
+
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
-  private readonly openAiUrl = 'https://api.openai.com/v1/chat/completions';
   private readonly model = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
-  constructor(private readonly http: HttpService) {}
+  constructor(private readonly openai: OpenAI) {}
 
   /**
    * Used for FINAL answers to the user (based on passages/chunks).
@@ -25,11 +33,12 @@ export class AiService {
   ): Promise<string> {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      this.logger.warn('OPENAI_API_KEY is not set. Returning fallback answer.');
+      this.logger.warn(
+        'OPENAI_API_KEY is not set. Returning fallback answer in generateAnswer().',
+      );
       return 'AI не е конфигуриран (липсва OPENAI_API_KEY). В момента виждаш само суровия контекст от базата.';
     }
 
-    // 🧠 Stronger legal system prompt
     const systemPrompt = `
 Ти си "AIAdvocate" – виртуален юридически помощник по българско право.
 
@@ -71,34 +80,23 @@ ${contextText}
 `.trim();
 
     try {
-      const response$ = this.http.post(
-        this.openAiUrl,
-        {
-          model: this.model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-          ],
-          temperature: 0.2, // по-стегнат, по-малко халюцинации
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-          },
-        },
-      );
-
-      const { data } = await firstValueFrom(response$);
+      const res = await this.openai.chat.completions.create({
+        model: this.model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.2,
+      });
 
       const answer =
-        data?.choices?.[0]?.message?.content ??
+        res.choices?.[0]?.message?.content ??
         'Не успях да получа валиден отговор от модела.';
 
       return answer;
     } catch (error: any) {
       this.logger.error(
-        `Error while calling OpenAI: ${error.message}`,
+        `Error while calling OpenAI (generateAnswer): ${error.message}`,
         error.stack,
       );
       return 'Възникна грешка при комуникацията с AI модела. Опитай отново по-късно.';
@@ -106,11 +104,7 @@ ${contextText}
   }
 
   /**
-   * NEW: Rewrite a colloquial user question into a better semantic-search query
-   * for Bulgarian legal texts.
-   *
-   * If the API key is missing or something fails, we gracefully fall back
-   * to the original question.
+   * Rewrite a colloquial user question into a better semantic-search query.
    */
   async rewriteLegalSearchQuery(question: string): Promise<string> {
     const apiKey = process.env.OPENAI_API_KEY;
@@ -143,28 +137,17 @@ ${contextText}
 `.trim();
 
     try {
-      const response$ = this.http.post(
-        this.openAiUrl,
-        {
-          model: this.model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-          ],
-          temperature: 0.1,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            'Content-Type': 'application/json',
-          },
-        },
-      );
-
-      const { data } = await firstValueFrom(response$);
+      const res = await this.openai.chat.completions.create({
+        model: this.model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.1,
+      });
 
       const rewritten =
-        data?.choices?.[0]?.message?.content?.trim() || question;
+        res.choices?.[0]?.message?.content?.trim() || question;
 
       this.logger.debug(
         `Legal search rewrite:\n  original="${question}"\n  rewritten="${rewritten}"`,
@@ -173,11 +156,116 @@ ${contextText}
       return rewritten;
     } catch (error: any) {
       this.logger.error(
-        `Error while calling OpenAI for rewrite: ${error.message}`,
+        `Error while calling OpenAI for rewriteLegalSearchQuery: ${error.message}`,
         error.stack,
       );
-      // Fallback: just use the original
       return question;
+    }
+  }
+
+  /**
+   * Analyze a Bulgarian legal question and return:
+   * - high-level domains
+   * - lawHints: Bulgarian names of relevant laws/codes.
+   */
+  async analyzeLegalQuestion(
+    question: string,
+  ): Promise<LegalQuestionAnalysis> {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      this.logger.warn(
+        'OPENAI_API_KEY is not set. Returning empty legal analysis.',
+      );
+      return { domains: [], lawHints: [] };
+    }
+
+    const systemPrompt = `
+Ти си помощник по българско право.
+
+Задачата ти е да анализираш въпрос на потребителя и да върнеш САМО JSON
+с два масива:
+
+- "domains": списък от кратки домейни, напр:
+  - "traffic" (движение по пътищата, КАТ, шофьорски книжки)
+  - "police" (МВР, проверка на самоличност, задържане)
+  - "labor" (трудов договор, работодател, работник, осигуровки)
+  - "tax" (НАП, данъци, ДДС, публични задължения)
+  - "consumer" (права на потребители, онлайн търговия, рекламации)
+  - "family" (развод, брак, деца, издръжка)
+  - "criminal" (НК, престъпления, наказателни дела)
+  - "other" ако не е ясно.
+
+- "lawHints": списък от БЪЛГАРСКИ НАИМЕНОВАНИЯ на закони или кодекси,
+  които според теб са релевантни. Напр.:
+  - "Закон за движението по пътищата"
+  - "Закон за Министерството на вътрешните работи"
+  - "Кодекс на труда"
+  - "Закон за данък върху добавената стойност"
+  - "Данъчно-осигурителен процесуален кодекс"
+  - "Наказателен кодекс"
+  - "Наказателно-процесуален кодекс"
+  - "Закон за защита на потребителите"
+  - "Семеен кодекс"
+  - "Административнопроцесуален кодекс"
+  - и др.
+
+ВЪРНИ само един JSON обект, без обяснения, без допълнителен текст.
+`.trim();
+
+    const userMessage = `
+Въпрос на потребителя (на български):
+
+"${question}"
+
+Моля, върни JSON с ключове "domains" и "lawHints".
+`.trim();
+
+    try {
+      const res = await this.openai.chat.completions.create({
+        model: this.model,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.1,
+      });
+
+      const content = res.choices?.[0]?.message?.content;
+
+      if (!content) {
+        this.logger.warn(
+          'analyzeLegalQuestion: empty content from model, returning fallback.',
+        );
+        return { domains: [], lawHints: [] };
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(content);
+      } catch (e) {
+        this.logger.warn(
+          `analyzeLegalQuestion: failed to parse JSON, content="${content}"`,
+        );
+        return { domains: [], lawHints: [] };
+      }
+
+      const domains = Array.isArray(parsed.domains) ? parsed.domains : [];
+      const lawHints = Array.isArray(parsed.lawHints) ? parsed.lawHints : [];
+
+      this.logger.debug(
+        `Legal question analysis:\n  domains=${JSON.stringify(
+          domains,
+        )}\n  lawHints=${JSON.stringify(lawHints)}`,
+      );
+
+      return { domains, lawHints };
+    } catch (error: any) {
+      this.logger.error(
+        `Error while calling OpenAI for analyzeLegalQuestion: ${error.message}`,
+        error.stack,
+      );
+      return { domains: [], lawHints: [] };
     }
   }
 }

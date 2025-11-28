@@ -7,6 +7,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { ConfigModule } from '@nestjs/config';
 import { AiModule } from './ai/ai.module';
 import { DatabaseModule } from './database/database.module';
+import { LegalChatModule } from './legal-chat/legal-chat.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { DatabaseModule } from './database/database.module';
     ),
     AiModule,
     LegalModule,
+    LegalChatModule, // 👈 add this
   ],
   controllers: [AppController],
   providers: [AppService],
