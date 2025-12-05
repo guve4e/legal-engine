@@ -10,6 +10,7 @@ async function bootstrap() {
       'http://localhost:5174',
       'http://localhost',
       'https://aiadvocate.ddns.net',
+      'https://legal-admin.ddns.net/',
       'https://legal-engine-admin.ddns.net'
     ],
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
