@@ -12,7 +12,8 @@ import { MessageDocument } from './schemas/message.schema';
 import { StartConversationDto } from './dto/start-conversation.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import type { LegalQaService, LegalQaAnswer } from './legal-chat.types';
-import { LEGAL_QA_SERVICE } from './legal-chat.types';
+import { LEGAL_QA_SERVICE, HISTORY_MODE } from './legal-chat.types';
+import { AiService } from '../ai/ai.service';
 
 @Injectable()
 export class LegalChatService {
@@ -21,10 +22,9 @@ export class LegalChatService {
   constructor(
     private readonly convRepo: ConversationRepository,
     private readonly msgRepo: MessageRepository,
-    // IMPORTANT: interface type imported via `import type`,
-    // and actual DI uses the token
     @Inject(LEGAL_QA_SERVICE)
     private readonly qa: LegalQaService,
+    private readonly aiService: AiService,
   ) {}
 
   /**
@@ -46,14 +46,25 @@ export class LegalChatService {
    * Handle a new user message inside an existing conversation:
    *  - store user message
    *  - load full history
-   *  - call LegalQaService with history
+   *  - call LegalQaService with history / summary
    *  - store assistant message
+   *  - optionally update summary (Option C)
    */
   async handleUserMessage(dto: SendMessageDto) {
+    this.logger.debug(
+      `handleUserMessage(): incoming dto = ${JSON.stringify(dto)}`,
+    );
+
     const conv = await this.convRepo.findById(dto.conversationId);
     if (!conv) {
       throw new NotFoundException('Разговорът не е намерен.');
     }
+
+    this.logger.debug(
+      `handleUserMessage(): found conversation ${conv._id.toString()} for userId=${
+        conv.userId
+      }, summaryLen=${conv.summary ? conv.summary.length : 0}`,
+    );
 
     // 1) Store user message
     const userMsg = await this.msgRepo.create({
@@ -62,22 +73,64 @@ export class LegalChatService {
       content: dto.content,
     });
 
-    // 2) Load all messages (including this one) as history
+    // 2) Load all messages (including the new one)
     const allMessages = await this.msgRepo.findByConversationId(
       conv._id.toString(),
     );
 
-    const history = allMessages.map((m) => ({
-      role: m.role,
-      content: m.content,
-    }));
+    this.logger.debug(
+      `handleUserMessage(): loaded ${allMessages.length} messages for conversation ${conv._id.toString()}`,
+    );
 
-    // 3) Call QA service with full history
+    // Build normalized history for the QA service
+    const fullHistory: { role: 'user' | 'assistant' | 'system'; content: string }[] =
+      allMessages.map((m) => ({
+        role: m.role as 'user' | 'assistant' | 'system',
+        content: m.content,
+      }));
+
+    // Option B: in "summary" mode we still send a short tail of the real history
+    const historyToSend =
+      HISTORY_MODE === 'full'
+        ? fullHistory
+        : fullHistory.slice(-6); // last few messages for extra context
+
+    this.logger.debug(
+      `handleUserMessage(): HISTORY_MODE=${HISTORY_MODE}, will send history length=${historyToSend.length} to QA service`,
+    );
+
+    this.logger.debug(
+      'handleUserMessage(): calling qa.answerQuestion with payload:',
+    );
+    this.logger.debug(
+      JSON.stringify(
+        {
+          userQuestion: dto.content,
+          conversationSummaryPreview: conv.summary
+            ? conv.summary.slice(0, 120)
+            : null,
+          historySample:
+            HISTORY_MODE === 'full'
+              ? fullHistory.slice(-3)
+              : fullHistory.slice(-3),
+        },
+        null,
+        2,
+      ),
+    );
+
+    // 3) Call QA service
     const qaResult: LegalQaAnswer = await this.qa.answerQuestion({
       userQuestion: dto.content,
       conversationSummary: conv.summary || null,
-      history,
+      history: historyToSend,
     });
+
+    this.logger.debug(
+      `handleUserMessage(): qaResult received, answer length=${
+        qaResult.answer?.length ?? 0
+      }, supportingChunks=${qaResult.supportingChunks?.length ?? 0}`,
+    );
 
     const assistantText = qaResult.answer;
 
@@ -87,6 +140,36 @@ export class LegalChatService {
       role: 'assistant',
       content: assistantText,
     });
+
+    // 5) Update summary in Option C
+    if (HISTORY_MODE === 'summary') {
+      try {
+        this.logger.debug(
+          'handleUserMessage(): updating conversation summary (HISTORY_MODE=summary)',
+        );
+
+        const newSummary = await this.aiService.updateConversationSummary({
+          previousSummary: conv.summary ?? null,
+          lastUserMessage: dto.content,
+          lastAssistantMessage: assistantText,
+        });
+
+        await this.convRepo.updateSummary(conv._id.toString(), newSummary);
+
+        this.logger.debug(
+          `handleUserMessage(): summary updated, newSummaryLen=${
+            newSummary ? newSummary.length : 0
+          }`,
+        );
+        conv.summary = newSummary;
+      } catch (e) {
+        this.logger.warn(
+          `Failed to update conversation summary: ${
+            (e as Error).message
+          }`,
+        );
+      }
+    }
 
     return {
       conversationId: conv._id.toString(),

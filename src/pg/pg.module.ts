@@ -2,8 +2,11 @@
 import { Module } from '@nestjs/common';
 import { Pool } from 'pg';
 import { PgLegalRepository } from './pg-legal.repository';
+import { AiUsageRepository } from './ai-usage.repository';
+import { TrafficRepository } from './traffic.repository';
 
 @Module({
+  imports: [],
   providers: [
     {
       provide: 'PG_POOL',
@@ -17,8 +20,15 @@ import { PgLegalRepository } from './pg-legal.repository';
         });
       },
     },
+    TrafficRepository,
     PgLegalRepository,
+    AiUsageRepository,
   ],
-  exports: ['PG_POOL', PgLegalRepository],
+  exports: [
+    'PG_POOL',
+    PgLegalRepository,
+    AiUsageRepository,
+    TrafficRepository,
+  ],
 })
 export class PgModule {}

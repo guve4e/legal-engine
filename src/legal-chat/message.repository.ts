@@ -10,8 +10,16 @@ export class MessageRepository {
     private readonly model: Model<MessageDocument>,
   ) {}
 
-  create(data: Partial<Message>): Promise<MessageDocument> {
-    return this.model.create(data);
+  async create(data: {
+    conversationId: string;
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+  }): Promise<MessageDocument> {
+    return this.model.create({
+      conversationId: data.conversationId,
+      role: data.role,
+      content: data.content,
+    });
   }
 
   findByConversationId(conversationId: string): Promise<MessageDocument[]> {

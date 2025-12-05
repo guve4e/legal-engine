@@ -15,6 +15,7 @@ export class LegalChatController {
 
   @Post('start')
   async startConversation(@Body() dto: StartConversationDto) {
+    console.log(`POST /legal-chat/start`, dto);
     const conv = await this.chatService.startConversation(dto);
     return {
       id: conv.id,
@@ -26,21 +27,25 @@ export class LegalChatController {
 
   @Post('message')
   async sendMessage(@Body() dto: SendMessageDto) {
+    console.log(`POST /legal-chat/message`, dto);
     return this.chatService.handleUserMessage(dto);
   }
 
   @Get('conversation/:id')
   async getConversation(@Param('id') id: string) {
+    console.log(`GET /legal-chat/conversation/${id}`);
     return this.chatService.getConversationWithMessages(id);
   }
 
   @Get('user/:userId')
   async listUserConversations(@Param('userId') userId: string) {
+    console.log(`GET /legal-chat/user/${userId}`);
     return this.chatService.listUserConversations(userId);
   }
 
   @Post('ask')
   async ask(@Body('question') question: string) {
+    console.log(`POST /legal-chat/ask`, question);
     if (!question || !question.trim()) {
       return { error: 'Моля, изпратете въпрос.' };
     }

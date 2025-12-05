@@ -14,6 +14,7 @@ import {
   AiService,
   AiContextItem,
   LegalQuestionAnalysis,
+  ChatTurn,
 } from '../ai/ai.service';
 import { Pool } from 'pg';
 import { EmbeddingsService } from './embeddings.service';
@@ -106,7 +107,12 @@ export class LegalService {
   /**
    * Legacy Mongo-based chat (kept for experiments / backup).
    */
-  async chat(question: string, domain?: string, limit = 5) {
+  async chat(
+    question: string,
+    domain?: string,
+    limit = 5,
+    history?: ChatTurn[],
+  ) {
     const passages = await this.getPassagesForChat(question, domain, limit);
 
     const aiAnswer = await this.aiService.generateAnswer(
@@ -115,6 +121,7 @@ export class LegalService {
         citation: p.citation,
         text: p.text,
       })),
+      { history },
     );
 
     return {
@@ -178,6 +185,52 @@ export class LegalService {
     return this.pgLegalRepo.listLaws();
   }
 
+  /**
+   * Decide if the question is likely non-legal, so we can refuse early instead of
+   * running heavy vector search + long-form answer.
+   */
+  private isLikelyNonLegal(analysis: LegalQuestionAnalysis, userQuestion: string): boolean {
+    const domains = Array.isArray(analysis.domains) ? analysis.domains : [];
+    const lawHints = Array.isArray(analysis.lawHints) ? analysis.lawHints : [];
+
+    // Whitelist meta-history questions (these should NOT be treated as non-legal)
+    const metaPatterns = [
+      'резюмирай',
+      'обобщи',
+      'какво обсъждахме',
+      'за какво говорихме',
+      'какво говорихме',
+      'summary',
+      'what did we talk',
+      'recap',
+    ];
+
+    const lowerQ = (userQuestion || '').toLowerCase();
+
+    const isMeta = metaPatterns.some((p) => lowerQ.includes(p));
+
+    if (isMeta) return false;
+
+    const noLawHints = lawHints.length === 0;
+
+    const noUsefulDomains =
+      domains.length === 0 ||
+      domains.every((d) =>
+        ['other', 'general', 'chitchat', 'smalltalk'].includes(
+          d.toLowerCase(),
+        ),
+      );
+
+    this.logger.debug(
+      `isLikelyNonLegal(): result=${noLawHints && noUsefulDomains}, ` +
+        `domains=${JSON.stringify(domains)}, ` +
+        `lawHints=${JSON.stringify(lawHints)}, ` +
+        `userQuestionPreview=${(userQuestion || '').slice(0, 80)}`,
+    );
+
+    return noLawHints && noUsefulDomains;
+  }
+
   // ---------------------------------------------------------------------------
   // 💡 Main AIAdvocate pipeline (Postgres + pgvector)
   // ---------------------------------------------------------------------------
@@ -195,17 +248,111 @@ export class LegalService {
    */
   async chatWithPg(
     question: string,
-    options?: { tier?: Tier; domainHint?: string },
+    options?: { tier?: Tier; domainHint?: string; history?: ChatTurn[] },
   ) {
     const tier = options?.tier ?? 'free';
     const tierConfig = this.getTierConfig(tier);
 
+    // 🟢 Step 0: евтин класификатор (legal / meta / non-legal)
+    const category = await this.aiService.classifyQuestionKind(question);
+    this.logger.debug(
+      `chatWithPg(): question="${question.slice(
+        0,
+        80,
+      )}", classifiedCategory=${category}`,
+    );
+
+    // 0a) Нелегален (smalltalk, глупости и т.н.) → режем веднага, без вектори
+    if (category === 'non-legal') {
+      const answer =
+        'AIAdvocate е правен асистент и е създаден да помага само по въпроси, ' +
+        'свързани с българското право.\n\n' +
+        'Моля, задай правен въпрос – например:\n' +
+        '• „Спряха ме от КАТ, какви са ми правата?“\n' +
+        '• „Как се обжалва електронен фиш?“\n' +
+        '• „Какви са санкциите при превишена скорост?“';
+
+      return {
+        question,
+        tier,
+        detectedDomains: [],
+        lawHints: [],
+        candidateLawIds: [],
+        tierConfig,
+        contextCount: 0,
+        context: [],
+        answer,
+      };
+    }
+
+    // 0b) Мета-въпроси („Резюмирай…“, „Какво обсъждахме…“) –
+    //      не правим правен анализ, а чисто резюме на разговора.
+    if (category === 'meta') {
+      const history = options?.history ?? [];
+
+      // Тук ползваме големия модел, но без вектори. Историята е в ChatTurn[].
+      const metaAnswer = await this.aiService.generateAnswer(
+        'Потребителят иска накратко обобщение на досегашния разговор. ' +
+        'Направи кратко, ясно резюме на български, без нови правни теми.',
+        [],
+        {
+          history,
+        },
+      );
+
+      return {
+        question,
+        tier,
+        detectedDomains: [],
+        lawHints: [],
+        candidateLawIds: [],
+        tierConfig,
+        contextCount: 0,
+        context: [],
+        answer: metaAnswer,
+      };
+    }
+
+    // 🟢 Ако сме тук → category === 'legal' → продължаваме със стария pipeline
     // 1) AI analysis
     const aiAnalysis = await this.aiService.analyzeLegalQuestion(question);
     const mergedAnalysis = this.mergeAnalysisWithHint(
       aiAnalysis,
       options?.domainHint,
     );
+
+    this.logger.debug(
+      `chatWithPg(): analysis for question="${question.slice(0, 80)}", ` +
+      `domains=${JSON.stringify(mergedAnalysis.domains ?? [])}, ` +
+      `lawHints=${JSON.stringify(mergedAnalysis.lawHints ?? [])}`,
+    );
+
+    // 👇 оставяш / ползваш isLikelyNonLegal ако искаш втори слой филтър.
+    if (this.isLikelyNonLegal(mergedAnalysis, question)) {
+      this.logger.debug(
+        `chatWithPg(): isLikelyNonLegal()=true, въпреки че classifier върна legal – показваме guardrail.`,
+      );
+
+      const answer =
+        'AIAdvocate е правен асистент и е създаден да помага само по въпроси, ' +
+        'свързани с българското право.\n\n' +
+        'Моля, задай правен въпрос – например:\n' +
+        '• „Спряха ме от КАТ, какви са ми правата?“\n' +
+        '• „Как се обжалва електронен фиш?“\n' +
+        '• „Какви са санкциите при превишена скорост?“';
+
+      return {
+        question,
+        tier,
+        detectedDomains: mergedAnalysis.domains ?? [],
+        lawHints: mergedAnalysis.lawHints ?? [],
+        candidateLawIds: [],
+        tierConfig,
+        contextCount: 0,
+        context: [],
+        answer,
+      };
+    }
 
     // 2) Law selection
     const allLaws = await this.pgLegalRepo.listLaws();
@@ -229,6 +376,7 @@ export class LegalService {
     const aiAnswer = await this.aiService.generateAnswer(
       question,
       contextItems,
+      { history: options?.history },
     );
 
     return {
@@ -243,7 +391,6 @@ export class LegalService {
       answer: aiAnswer,
     };
   }
-
   // ---------------------------------------------------------------------------
   // 🔍 Merge AI analysis with optional UI domain hint
   // ---------------------------------------------------------------------------

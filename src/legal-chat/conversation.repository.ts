@@ -21,4 +21,10 @@ export class ConversationRepository {
   listByUserId(userId: string): Promise<ConversationDocument[]> {
     return this.model.find({ userId }).sort({ createdAt: -1 }).exec();
   }
+
+  async updateSummary(id: string, summary: string | null) {
+    return this.model
+      .findByIdAndUpdate(id, { summary }, { new: true })
+      .exec();
+  }
 }

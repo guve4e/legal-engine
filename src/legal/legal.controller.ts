@@ -1,7 +1,5 @@
 import { Body, Controller, Get, Post } from '@nestjs/common';
-import { LegalService, Tier } from './legal.service';
-import { ChatDto } from './dto/chat.dto';
-import { ChatPgDto } from './dto/chat-pg.dto';
+import { LegalService } from './legal.service';
 import { AiService } from '../ai/ai.service';
 
 @Controller('legal')
@@ -10,25 +8,6 @@ export class LegalController {
     private readonly legalService: LegalService,
     private readonly aiService: AiService,
   ) {}
-
-  // -------------------------------------------------------
-  // Mongo
-  // -------------------------------------------------------
-
-  @Get('mongo-ping')
-  pingMongo() {
-    return this.legalService.ping();
-  }
-
-  @Post('chat')
-  async chat(@Body() body: ChatDto) {
-    const { question, domain, limit = 5 } = body;
-    return this.legalService.chat(question, domain, limit);
-  }
-
-  // -------------------------------------------------------
-  // Postgres PGVector
-  // -------------------------------------------------------
 
   @Get('pg-health')
   pgHealth() {
@@ -47,19 +26,6 @@ export class LegalController {
 
   @Post('debug/analyze-question')
   async debugAnalyze(@Body() body: { question: string }) {
-    const { question } = body;
-    return this.aiService.analyzeLegalQuestion(question);
-  }
-
-
-  @Post('chat-pg')
-  async chatPg(@Body() body: ChatPgDto): Promise<any> {
-    const { question } = body;
-
-    // Backend decides tier, user just asks the question
-    const tier: Tier =
-      (process.env.AIADVOCATE_FORCE_TIER as Tier) ?? 'free';
-
-    return this.legalService.chatWithPg(question, { tier });
+    return this.aiService.analyzeLegalQuestion(body.question);
   }
 }

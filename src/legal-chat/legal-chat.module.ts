@@ -1,4 +1,3 @@
-// src/legal-chat/legal-chat.module.ts
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 
@@ -15,11 +14,11 @@ import { ConversationRepository } from './conversation.repository';
 import { MessageRepository } from './message.repository';
 
 import { LEGAL_QA_SERVICE } from './legal-chat.types';
-import { LegalQaServiceImpl } from './legal-qa.service.impl';
+import { LegalChatPgQaService } from './legal-chat.pg-qa.service';
 
 import { AiModule } from '../ai/ai.module';
-import { LegalModule } from '../legal/legal.module'; // 👈 gives EmbeddingsService
-import { PgModule } from '../pg/pg.module';           // 👈 gives PgLegalRepository
+import { LegalModule } from '../legal/legal.module';
+import { PgModule } from '../pg/pg.module';
 
 @Module({
   imports: [
@@ -28,7 +27,7 @@ import { PgModule } from '../pg/pg.module';           // 👈 gives PgLegalRepos
       { name: Message.name, schema: MessageSchema },
     ]),
     AiModule,
-    LegalModule, // 👈 now EmbeddingsService is in scope
+    LegalModule,
     PgModule,
   ],
   controllers: [LegalChatController],
@@ -38,7 +37,7 @@ import { PgModule } from '../pg/pg.module';           // 👈 gives PgLegalRepos
     MessageRepository,
     {
       provide: LEGAL_QA_SERVICE,
-      useClass: LegalQaServiceImpl,
+      useClass: LegalChatPgQaService,
     },
   ],
   exports: [LegalChatService],

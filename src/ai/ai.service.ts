@@ -1,10 +1,22 @@
 // src/ai/ai.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { OpenAI } from 'openai';
+import { AiUsageService } from './ai-usage.service'; // 👈 нов import
 
 export interface AiContextItem {
   citation?: string;
   text: string;
+}
+
+export interface ChatTurn {
+  role: 'user' | 'assistant';
+  text: string;
+}
+
+export type QuestionCategory = 'legal' | 'meta' | 'non-legal';
+
+export interface QuestionKindResult {
+  category: QuestionCategory;
 }
 
 /**
@@ -22,14 +34,20 @@ export class AiService {
   private readonly logger = new Logger(AiService.name);
   private readonly model = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
-  constructor(private readonly openai: OpenAI) {}
+  constructor(
+    private readonly openai: OpenAI,
+    private readonly aiUsage: AiUsageService, // 👈 инжектираме usage logger-а
+  ) {}
 
   /**
    * Used for FINAL answers to the user (based on passages/chunks).
+   *
+   * `opts.history` – предишни съобщения в чата (само за по-добър контекст).
    */
   async generateAnswer(
     question: string,
     context: AiContextItem[],
+    opts?: { history?: ChatTurn[] },
   ): Promise<string> {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
@@ -39,16 +57,23 @@ export class AiService {
       return 'AI не е конфигуриран (липсва OPENAI_API_KEY). В момента виждаш само суровия контекст от базата.';
     }
 
+    const history = opts?.history ?? [];
+
     const systemPrompt = `
 Ти си "AIAdvocate" – виртуален юридически помощник по българско право.
 
 Правила:
 - Отговаряш САМО на български език.
-- Опираш се САМО на предоставените откъси от закони/нормативни актове.
+- Опираш се САМО на предоставените откъси от закони/нормативни актове (контекст).
 - НЕ измисляш членове, алинеи или норми, които не присъстват в контекста.
-- Ако липсва достатъчна информация в контекста, го казваш ясно и препоръчваш консултация с адвокат.
+- Ако липсва достатъчна информация в контекста, го казваш ясно и препоръчваш консултация с адвокат
+  или проверка в официален източник (напр. самия закон в ДВ/lex.bg).
 - Пишеш ясно и структурирано, без излишен жаргон.
+- Стремиш се да дадеш ИЗЧЕРПАТЕЛЕН отговор въз основа на контекста
+  (обикновено поне 3–5 абзаца, ако има достатъчно материал).
 - В края на всеки отговор добавяш кратко напомняне, че това не е официална правна консултация.
+- Ако текущият въпрос очевидно продължава предишен („А ако…“, „А в този случай…“),
+  вземи предвид историята на разговора, но пак се опирай САМО на юридическия контекст.
 `.trim();
 
     const contextText =
@@ -63,20 +88,41 @@ export class AiService {
           .join('\n\n')
         : 'Няма предоставени откъси.';
 
+    const historyText =
+      history && history.length
+        ? history
+          .map((h, i) => {
+            const who = h.role === 'user' ? 'Потребител' : 'AIAdvocate';
+            return `${who} ${i + 1}:\n${h.text}`;
+          })
+          .join('\n\n')
+        : 'Няма предишен контекст от разговора.';
+
     const userMessage = `
-Въпрос на потребителя:
+Предишен разговор (резюме на чата до момента):
+${historyText}
+
+Текущ въпрос на потребителя:
 ${question}
 
 По-долу са наличните откъси от български закони и свързани текстове.
-Използвай само тях при анализа си:
+Използвай САМО тях при анализа си:
 
 ${contextText}
 
-Моля, дай отговор на български, като:
-1) Кратко обясниш какво важи в конкретния случай според тези текстове.
-2) Ако е възможно, посочиш конкретни членове/алинии, на които се опираш (само ако се виждат ясно в текста).
-3) Обясниш с нормален, разбираем език, не само юридически жаргон.
-4) В края изрично добавиш, че това НЕ е официална правна консултация, а помощ от AI асистент.
+Моля, дай отговор на български, като следваш този формат:
+
+1) **Общо заключение**
+   - 2–4 изречения, които обобщават какво важи в случая според тези текстове.
+2) **Подробности по закона**
+   - Обясни по-детайлно какво следва от всеки по-важен откъс.
+   - Ако в текста ясно се виждат членове/алинии, посочи ги (но НЕ измисляй такива, ако ги няма).
+3) **Какво липсва / ограничения на отговора**
+   - Ясно кажи какво НЕ може да бъде отговорено на база на тези откъси.
+4) **Препоръка**
+   - Кратко посочи към какъв тип специалист или институция е разумно да се обърне човекът при нужда.
+5) **Дисклеймър**
+   - В края изрично добави, че това НЕ е официална правна консултация, а помощ от AI асистент.
 `.trim();
 
     try {
@@ -86,8 +132,34 @@ ${contextText}
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userMessage },
         ],
-        temperature: 0.2,
+        temperature: 0.25,
       });
+
+      // 🔢 metering
+      const usage = (res as any).usage;
+      if (usage) {
+        const promptTokens = usage.prompt_tokens ?? 0;
+        const completionTokens = usage.completion_tokens ?? 0;
+        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const costUsd = this.aiUsage.computeCostUsd(
+          this.model,
+          promptTokens,
+          completionTokens,
+        );
+
+        await this.aiUsage.record({
+          kind: 'generateAnswer',
+          model: this.model,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          totalTokens,
+          costUsd,
+          extra: {
+            questionPreview: question.slice(0, 200),
+            contextCount: context.length,
+          },
+        });
+      }
 
       const answer =
         res.choices?.[0]?.message?.content ??
@@ -146,8 +218,32 @@ ${contextText}
         temperature: 0.1,
       });
 
-      const rewritten =
-        res.choices?.[0]?.message?.content?.trim() || question;
+      // 🔢 metering
+      const usage = (res as any).usage;
+      if (usage) {
+        const promptTokens = usage.prompt_tokens ?? 0;
+        const completionTokens = usage.completion_tokens ?? 0;
+        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const costUsd = this.aiUsage.computeCostUsd(
+          this.model,
+          promptTokens,
+          completionTokens,
+        );
+
+        await this.aiUsage.record({
+          kind: 'rewriteLegalSearchQuery',
+          model: this.model,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          totalTokens,
+          costUsd,
+          extra: {
+            questionPreview: question.slice(0, 200),
+          },
+        });
+      }
+
+      const rewritten = res.choices?.[0]?.message?.content?.trim() || question;
 
       this.logger.debug(
         `Legal search rewrite:\n  original="${question}"\n  rewritten="${rewritten}"`,
@@ -168,9 +264,7 @@ ${contextText}
    * - high-level domains
    * - lawHints: Bulgarian names of relevant laws/codes.
    */
-  async analyzeLegalQuestion(
-    question: string,
-  ): Promise<LegalQuestionAnalysis> {
+  async analyzeLegalQuestion(question: string): Promise<LegalQuestionAnalysis> {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       this.logger.warn(
@@ -231,6 +325,31 @@ ${contextText}
         temperature: 0.1,
       });
 
+      // 🔢 metering
+      const usage = (res as any).usage;
+      if (usage) {
+        const promptTokens = usage.prompt_tokens ?? 0;
+        const completionTokens = usage.completion_tokens ?? 0;
+        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const costUsd = this.aiUsage.computeCostUsd(
+          this.model,
+          promptTokens,
+          completionTokens,
+        );
+
+        await this.aiUsage.record({
+          kind: 'analyzeLegalQuestion',
+          model: this.model,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          totalTokens,
+          costUsd,
+          extra: {
+            questionPreview: question.slice(0, 200),
+          },
+        });
+      }
+
       const content = res.choices?.[0]?.message?.content;
 
       if (!content) {
@@ -266,6 +385,208 @@ ${contextText}
         error.stack,
       );
       return { domains: [], lawHints: [] };
+    }
+  }
+
+  async updateConversationSummary(input: {
+    previousSummary?: string | null;
+    lastUserMessage: string;
+    lastAssistantMessage: string;
+  }): Promise<string> {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      this.logger.warn(
+        'OPENAI_API_KEY is not set. Returning empty summary in updateConversationSummary().',
+      );
+      return input.previousSummary ?? '';
+    }
+
+    const systemPrompt = `
+Ти поддържаш КРАТКО резюме на правен разговор на български.
+
+Правила:
+- Максимум 2–3 изречения.
+- Дръж само най-важното по същество (темите и контекста).
+- Не включвай детайлни суми, дати, имена, освен ако не са ключови.
+- Пиши само резюме, без допълнителни обяснения.
+`.trim();
+
+    const userPromptLines: string[] = [];
+
+    if (input.previousSummary) {
+      userPromptLines.push(`Досегашно резюме:\n${input.previousSummary}\n`);
+    } else {
+      userPromptLines.push('Досегашно резюме: (няма)\n');
+    }
+
+    userPromptLines.push('Последен въпрос от потребителя:');
+    userPromptLines.push(input.lastUserMessage);
+    userPromptLines.push('\nПоследен отговор от AI:');
+    userPromptLines.push(input.lastAssistantMessage);
+    userPromptLines.push('\nАктуализирай резюмето:');
+
+    const userMessage = userPromptLines.join('\n');
+
+    try {
+      const res = await this.openai.chat.completions.create({
+        model: this.model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.1,
+      });
+
+      // 🔢 metering
+      const usage = (res as any).usage;
+      if (usage) {
+        const promptTokens = usage.prompt_tokens ?? 0;
+        const completionTokens = usage.completion_tokens ?? 0;
+        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const costUsd = this.aiUsage.computeCostUsd(
+          this.model,
+          promptTokens,
+          completionTokens,
+        );
+
+        await this.aiUsage.record({
+          kind: 'updateConversationSummary',
+          model: this.model,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          totalTokens,
+          costUsd,
+        });
+      }
+
+      const summary =
+        res.choices?.[0]?.message?.content?.trim() ??
+        input.previousSummary ??
+        '';
+
+      return summary;
+    } catch (error: any) {
+      this.logger.error(
+        `Error while calling OpenAI (updateConversationSummary): ${error.message}`,
+        error.stack,
+      );
+      return input.previousSummary ?? '';
+    }
+  }
+
+  /**
+   * Евтин класификатор: определя дали въпросът е:
+   *  - "legal"     → истински правен въпрос
+   *  - "meta"      → въпрос за самия разговор (резюме, какво обсъждахме и т.н.)
+   *  - "non-legal" → всичко останало (smalltalk, рецепти, мотивация и пр.)
+   *
+   * ⚠️ Сигнатурата остава същата, само реализацията е сменена да ползва chat.completions
+   *    с JSON output, без новия `responses` API → няма вече TS грешки.
+   */
+  async classifyQuestionKind(question: string): Promise<QuestionCategory> {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      this.logger.warn(
+        'OPENAI_API_KEY is not set. Returning default category "legal" in classifyQuestionKind().',
+      );
+      return 'legal';
+    }
+
+    const systemPrompt = `
+Ти си класификатор на потребителски въпроси за правен асистент AIAdvocate.
+
+КАТЕГОРИИ:
+- "legal"  → въпрос за българско право, НАП, КАТ, съд, договори, фирми, данъци, трудово право, имоти, административни процедури и т.н.
+- "meta"   → въпрос за самия чат или разговор
+             (например "резюмирай накратко какво обсъждахме досега",
+              "за какво говорихме преди малко", "какво беше вторият ми въпрос",
+              "как работиш", "какво е AIAdvocate")
+- "non-legal" → всичко останало (smalltalk, "как си", вицове, фитнес, диети,
+                готвене, мотивация, спорт и т.н.)
+
+Инструкции:
+1) Определи най-подходящата категория за въпроса.
+2) Върни САМО валиден JSON в този формат:
+{"category": "legal" | "meta" | "non-legal"}
+
+Без никакви обяснения, без текст преди или след JSON-а.
+`.trim();
+
+    const userMessage = `Въпрос на потребителя: """${question}"""`;
+
+    try {
+      const model = 'gpt-4o-mini';
+
+      const res = await this.openai.chat.completions.create({
+        model, // евтин модел за класификатора
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0,
+        max_tokens: 50,
+      });
+
+      // 🔢 metering
+      const usage = (res as any).usage;
+      if (usage) {
+        const promptTokens = usage.prompt_tokens ?? 0;
+        const completionTokens = usage.completion_tokens ?? 0;
+        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const costUsd = this.aiUsage.computeCostUsd(
+          model,
+          promptTokens,
+          completionTokens,
+        );
+
+        await this.aiUsage.record({
+          kind: 'classifyQuestionKind',
+          model,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          totalTokens,
+          costUsd,
+          extra: {
+            questionPreview: question.slice(0, 200),
+          },
+        });
+      }
+
+      const raw = res.choices?.[0]?.message?.content?.trim() ?? '';
+
+      let category: QuestionCategory = 'legal';
+
+      try {
+        const parsed = JSON.parse(raw) as QuestionKindResult;
+        if (
+          parsed.category === 'legal' ||
+          parsed.category === 'meta' ||
+          parsed.category === 'non-legal'
+        ) {
+          category = parsed.category;
+        } else {
+          this.logger.warn(
+            `classifyQuestionKind: invalid category value in JSON, raw="${raw}"`,
+          );
+        }
+      } catch (e) {
+        this.logger.warn(
+          `classifyQuestionKind: failed to parse JSON, raw="${raw}"`,
+        );
+      }
+
+      this.logger.debug(
+        `classifyQuestionKind(): question="${question}", raw="${raw}", category=${category}`,
+      );
+
+      return category;
+    } catch (error: any) {
+      this.logger.error(
+        `Error while calling OpenAI for classifyQuestionKind: ${error.message}`,
+        error.stack,
+      );
+      return 'legal';
     }
   }
 }

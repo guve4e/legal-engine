@@ -15,6 +15,12 @@ export interface LegalQaAnswer {
   supportingChunks?: SupportingChunk[];
 }
 
+
+export type HistoryMode = 'summary' | 'full';
+
+export const HISTORY_MODE: HistoryMode =
+  (process.env.AIADVOCATE_HISTORY_MODE as HistoryMode) || 'summary';
+
 export interface LegalQaService {
   answerQuestion(input: {
     userQuestion: string;

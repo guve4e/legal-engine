@@ -1,9 +1,12 @@
 // src/ai/ai.module.ts
 import { Module } from '@nestjs/common';
 import { AiService } from './ai.service';
+import { AiUsageService } from './ai-usage.service';
+import { PgModule } from '../pg/pg.module';
 import { OpenAI } from 'openai';
 
 @Module({
+  imports: [PgModule],
   providers: [
     {
       provide: OpenAI,
@@ -23,7 +26,8 @@ import { OpenAI } from 'openai';
       },
     },
     AiService,
+    AiUsageService,
   ],
-  exports: [AiService],
+  exports: [AiService, AiUsageService],
 })
 export class AiModule {}
