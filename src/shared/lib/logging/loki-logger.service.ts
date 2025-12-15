@@ -108,7 +108,7 @@ export class LokiLoggerService implements LoggerService {
   }
 
   private isDevelopmentEnvironment(): boolean {
-    return process.env['NODE_ENV'] === 'dev';
+    return ['dev', 'development'].includes(process.env['NODE_ENV'] || '');
   }
 
   private cleanStackTrace(stack: string, maxDepth: number = 4): string {

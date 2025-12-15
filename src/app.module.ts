@@ -6,20 +6,18 @@ import { LegalModule } from './legal/legal.module';
 import { MongooseModule } from '@nestjs/mongoose';
 import { ConfigModule } from '@nestjs/config';
 import { AiModule } from './ai/ai.module';
-import { DatabaseModule } from './database/database.module';
 import { LegalChatModule } from './legal-chat/legal-chat.module';
 import { AdminModule } from './admin/admin.module';
 import { AdminLawsModule } from './admin/admin-laws.module';
 import { AuthModule } from './auth/auth.module';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthUser } from './auth/auth-user.entity';
-
+import { ProceduresModule } from './procedures/procedures.module';
+import { DocumentsModule } from './documents/documents.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
-    DatabaseModule,
-
     MongooseModule.forRoot(
       process.env.LEGAL_MONGO_URI ||
       'mongodb://valio:supersecretpassword@192.168.1.60:27017/legal?authSource=admin',
@@ -42,6 +40,8 @@ import { AuthUser } from './auth/auth-user.entity';
     AdminModule,
     AdminLawsModule,
     AuthModule,
+    ProceduresModule,
+    DocumentsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

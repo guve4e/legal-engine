@@ -2,32 +2,18 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { OpenAI } from 'openai';
 import { AiUsageService } from './ai-usage.service'; // 👈 нов import
+import {
+  AiContextItem,
+  ChatTurn,
+  QuestionCategory,
+  LegalQuestionAnalysis, QuestionKindResult,
+} from './ai.types';
 
-export interface AiContextItem {
-  citation?: string;
-  text: string;
-}
-
-export interface ChatTurn {
-  role: 'user' | 'assistant';
-  text: string;
-}
-
-export type QuestionCategory = 'legal' | 'meta' | 'non-legal';
-
-export interface QuestionKindResult {
-  category: QuestionCategory;
-}
-
-/**
- * Result of analyzing a Bulgarian legal question.
- * - domains: high-level categories (traffic, police, labor, tax, consumer, family, criminal, other)
- * - lawHints: Bulgarian names of relevant laws/codes (e.g. "Закон за движението по пътищата")
- */
-export interface LegalQuestionAnalysis {
-  domains: string[];
-  lawHints: string[];
-}
+import {
+  ProcedureSelectionInput,
+  ProcedureSelectionResult,
+  ProcedureDraftFromAi,
+} from '../procedures/procedure-ai.types';
 
 @Injectable()
 export class AiService {
@@ -36,7 +22,7 @@ export class AiService {
 
   constructor(
     private readonly openai: OpenAI,
-    private readonly aiUsage: AiUsageService, // 👈 инжектираме usage logger-а
+    private readonly aiUsage: AiUsageService,
   ) {}
 
   /**
@@ -79,23 +65,23 @@ export class AiService {
     const contextText =
       context && context.length
         ? context
-          .map(
-            (c, i) =>
-              `# Източник ${i + 1}\n` +
-              (c.citation ? `Цитат: ${c.citation}\n` : '') +
-              `Текст:\n${c.text}`,
-          )
-          .join('\n\n')
+            .map(
+              (c, i) =>
+                `# Източник ${i + 1}\n` +
+                (c.citation ? `Цитат: ${c.citation}\n` : '') +
+                `Текст:\n${c.text}`,
+            )
+            .join('\n\n')
         : 'Няма предоставени откъси.';
 
     const historyText =
       history && history.length
         ? history
-          .map((h, i) => {
-            const who = h.role === 'user' ? 'Потребител' : 'AIAdvocate';
-            return `${who} ${i + 1}:\n${h.text}`;
-          })
-          .join('\n\n')
+            .map((h, i) => {
+              const who = h.role === 'user' ? 'Потребител' : 'AIAdvocate';
+              return `${who} ${i + 1}:\n${h.text}`;
+            })
+            .join('\n\n')
         : 'Няма предишен контекст от разговора.';
 
     const userMessage = `
@@ -140,7 +126,8 @@ ${contextText}
       if (usage) {
         const promptTokens = usage.prompt_tokens ?? 0;
         const completionTokens = usage.completion_tokens ?? 0;
-        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const totalTokens =
+          usage.total_tokens ?? promptTokens + completionTokens;
         const costUsd = this.aiUsage.computeCostUsd(
           this.model,
           promptTokens,
@@ -223,7 +210,8 @@ ${contextText}
       if (usage) {
         const promptTokens = usage.prompt_tokens ?? 0;
         const completionTokens = usage.completion_tokens ?? 0;
-        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const totalTokens =
+          usage.total_tokens ?? promptTokens + completionTokens;
         const costUsd = this.aiUsage.computeCostUsd(
           this.model,
           promptTokens,
@@ -330,7 +318,8 @@ ${contextText}
       if (usage) {
         const promptTokens = usage.prompt_tokens ?? 0;
         const completionTokens = usage.completion_tokens ?? 0;
-        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const totalTokens =
+          usage.total_tokens ?? promptTokens + completionTokens;
         const costUsd = this.aiUsage.computeCostUsd(
           this.model,
           promptTokens,
@@ -442,7 +431,8 @@ ${contextText}
       if (usage) {
         const promptTokens = usage.prompt_tokens ?? 0;
         const completionTokens = usage.completion_tokens ?? 0;
-        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const totalTokens =
+          usage.total_tokens ?? promptTokens + completionTokens;
         const costUsd = this.aiUsage.computeCostUsd(
           this.model,
           promptTokens,
@@ -533,7 +523,8 @@ ${contextText}
       if (usage) {
         const promptTokens = usage.prompt_tokens ?? 0;
         const completionTokens = usage.completion_tokens ?? 0;
-        const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+        const totalTokens =
+          usage.total_tokens ?? promptTokens + completionTokens;
         const costUsd = this.aiUsage.computeCostUsd(
           model,
           promptTokens,
@@ -588,5 +579,183 @@ ${contextText}
       );
       return 'legal';
     }
+  }
+
+  async selectBestProcedure(
+    question: string,
+    candidates: ProcedureSelectionInput[],
+  ): Promise<ProcedureSelectionResult> {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey || candidates.length === 0) {
+      return {
+        slug: candidates[0]?.slug ?? null,
+        reason: 'no-api-or-candidates',
+      };
+    }
+
+    const systemPrompt = `
+Ти си асистент по българско право. Задачата ти е:
+
+- Да избереш най-подходящата процедура от даден списък
+  според въпроса на потребителя.
+- Ако НЯМА подходяща, върни "slug": null.
+- Върни САМО JSON: {"slug":"...", "reason":"..."}.
+`.trim();
+
+    const userMessage = `
+Въпрос на потребителя:
+"${question}"
+
+Кандидат процедури:
+${candidates
+  .map(
+    (c) =>
+      `- slug: ${c.slug}\n  име: ${c.name}\n  описание: ${c.shortDescription}\n  ключови думи: ${c.keywords.join(
+        ', ',
+      )}`,
+  )
+  .join('\n\n')}
+
+Моля, избери най-подходящата процедура (slug) или null, ако въпросът не пасва.
+`;
+
+    const res = await this.openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ],
+      temperature: 0,
+      max_tokens: 150,
+    });
+
+    const raw =
+      res.choices?.[0]?.message?.content ??
+      '{"slug":null,"reason":"no-content"}';
+    try {
+      const parsed = JSON.parse(raw);
+      return {
+        slug: parsed.slug ?? null,
+        reason: parsed.reason ?? '',
+      };
+    } catch {
+      return { slug: null, reason: 'parse-error' };
+    }
+  }
+
+  async generateProcedureDraftFromContext(input: {
+    scenarioDescription: string;
+    question: string;
+    lawContext: AiContextItem[];
+  }): Promise<ProcedureDraftFromAi> {
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      this.logger.warn(
+        'OPENAI_API_KEY missing in generateProcedureDraftFromContext()',
+      );
+      throw new Error('AI not configured');
+    }
+
+    const systemPrompt = `
+Ти си български юридически асистент и трябва да СТРУКТУРИРАШ процедура,
+а не да даваш свободен текстов отговор.
+
+Задачата:
+- Получаваш описан казус (сценарий) и откъси от закони.
+- Трябва да върнеш САМО JSON обект (response_format=json_object) за "чернова" на процедура.
+
+Тази чернова ще се ползва от програмист, който ще я редактира и ще я вкара в система.
+Не се притеснявай да предложиш структура, програмистът ще я променя при нужда.
+
+Формат на JSON:
+{
+  "slugSuggestion": "zan58_objection_kat",
+  "name": "Възражение срещу акт по чл. 58 ЗАНН",
+  "shortDescription": "...",
+  "domains": ["traffic", "..."],
+  "lawHints": ["Закон за административните нарушения и наказания"],
+  "keywords": ["акт", "АУАН", "глоба", "КАТ", "възражение"],
+  "requiredFields": [
+    {
+      "key": "fullName",
+      "label": "Три имена",
+      "type": "string",
+      "required": true,
+      "helpText": "Както е по лична карта."
+    }
+    // ...
+  ],
+  "steps": [
+    "Стъпка 1 ...",
+    "Стъпка 2 ..."
+  ],
+  "lawRefs": [
+    {
+      "lawName": "Закон за административните нарушения и наказания",
+      "article": "чл. 44",
+      "comment": "Урежда срока за възражение срещу акт."
+    }
+  ],
+  "documentOutline": {
+    "title": "ВЪЗРАЖЕНИЕ",
+    "intro": "Уважаеми ... {{issuingAuthority}}, ...",
+    "body": "Описвам фактите: {{facts}} ...",
+    "closing": "Моля акта да бъде отменен ... \nДата: {{currentDate}}\nПодпис: {{fullName}}"
+  }
+}
+
+Правила:
+- Връщаш САМО JSON, без обяснения.
+- Пиши на български.
+- Не измисляй закони, използвай очевидно релевантните според контекста.
+`.trim();
+
+    const contextText =
+      input.lawContext && input.lawContext.length
+        ? input.lawContext
+            .map(
+              (c, i) => `# Източник ${i + 1}\n${c.citation ?? ''}\n${c.text}`,
+            )
+            .join('\n\n')
+        : 'Няма контекст.';
+
+    const userMessage = `
+Казус (описан от потребителя):
+${input.scenarioDescription}
+
+Оригинален въпрос:
+${input.question}
+
+Откъси от закони:
+${contextText}
+
+Моля, върни САМО един JSON обект, описващ чернова на процедура според горния формат.
+`.trim();
+
+    const res = await this.openai.chat.completions.create({
+      model: this.model,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userMessage },
+      ],
+      temperature: 0.2,
+    });
+
+    const content = res.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error('Empty response from model for procedure draft');
+    }
+
+    let parsed: ProcedureDraftFromAi;
+    try {
+      parsed = JSON.parse(content);
+    } catch (e) {
+      this.logger.error(`Failed to parse procedure draft JSON: ${content}`);
+      throw new Error('Invalid JSON from model in procedure draft');
+    }
+
+    return parsed;
   }
 }

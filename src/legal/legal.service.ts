@@ -2,6 +2,8 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import { Pool } from 'pg';
+
 import {
   LegalSource,
   LegalSourceDocument,
@@ -10,19 +12,18 @@ import {
   LegalPassage,
   LegalPassageDocument,
 } from './schemas/legal-passage.schema';
-import {
-  AiService,
-  AiContextItem,
-  LegalQuestionAnalysis,
-  ChatTurn,
-} from '../ai/ai.service';
-import { Pool } from 'pg';
+
+import { AiService } from '../ai/ai.service';
+
 import { EmbeddingsService } from './embeddings.service';
 import {
   PgLegalRepository,
   LawRow,
   LawChunkRow,
 } from '../pg/pg-legal.repository';
+
+import { LawSelectorService } from './law-selector.service';
+import { AiContextItem, ChatTurn, LegalQuestionAnalysis } from '../ai/ai.types';
 
 /**
  * Tier – matches AIAdvocate plans:
@@ -39,21 +40,9 @@ interface TierConfig {
 }
 
 const TIER_CONFIG: Record<Tier, TierConfig> = {
-  free: {
-    maxLaws: 3,
-    perLawLimit: 3,
-    globalFallbackLimit: 5,
-  },
-  plus: {
-    maxLaws: 5,
-    perLawLimit: 5,
-    globalFallbackLimit: 12,
-  },
-  pro: {
-    maxLaws: 8,
-    perLawLimit: 8,
-    globalFallbackLimit: 25,
-  },
+  free: { maxLaws: 3, perLawLimit: 3, globalFallbackLimit: 5 },
+  plus: { maxLaws: 5, perLawLimit: 5, globalFallbackLimit: 12 },
+  pro: { maxLaws: 8, perLawLimit: 8, globalFallbackLimit: 25 },
 };
 
 @Injectable()
@@ -73,8 +62,9 @@ export class LegalService {
     private readonly pgPool: Pool,
 
     private readonly embeddingsService: EmbeddingsService,
-
     private readonly pgLegalRepo: PgLegalRepository,
+
+    private readonly lawSelector: LawSelectorService,
   ) {}
 
   private getTierConfig(tier?: Tier): TierConfig {
@@ -92,9 +82,7 @@ export class LegalService {
   async searchPassages(query: string, domain?: string) {
     const filter: any = {};
 
-    if (domain) {
-      filter.domains = domain;
-    }
+    if (domain) filter.domains = domain;
 
     if (query && query.trim().length > 0) {
       const regex = new RegExp(query.trim(), 'i');
@@ -104,9 +92,6 @@ export class LegalService {
     return this.legalPassageModel.find(filter).limit(20).lean();
   }
 
-  /**
-   * Legacy Mongo-based chat (kept for experiments / backup).
-   */
   async chat(
     question: string,
     domain?: string,
@@ -117,10 +102,7 @@ export class LegalService {
 
     const aiAnswer = await this.aiService.generateAnswer(
       question,
-      passages.map((p) => ({
-        citation: p.citation,
-        text: p.text,
-      })),
+      passages.map((p) => ({ citation: p.citation, text: p.text })),
       { history },
     );
 
@@ -141,11 +123,7 @@ export class LegalService {
     };
   }
 
-  async getPassagesForChat(
-    question: string,
-    domain?: string,
-    limit = 5,
-  ) {
+  async getPassagesForChat(question: string, domain?: string, limit = 5) {
     let passages = await this.searchPassages(question, domain);
 
     if ((!passages || passages.length === 0) && domain) {
@@ -175,25 +153,20 @@ export class LegalService {
 
   async pgStats() {
     const stats = await this.pgLegalRepo.getStats();
-    return {
-      message: 'Postgres legal DB is reachable',
-      ...stats,
-    };
+    return { message: 'Postgres legal DB is reachable', ...stats };
   }
 
   async listPgLaws() {
     return this.pgLegalRepo.listLaws();
   }
 
-  /**
-   * Decide if the question is likely non-legal, so we can refuse early instead of
-   * running heavy vector search + long-form answer.
-   */
-  private isLikelyNonLegal(analysis: LegalQuestionAnalysis, userQuestion: string): boolean {
+  private isLikelyNonLegal(
+    analysis: LegalQuestionAnalysis,
+    userQuestion: string,
+  ): boolean {
     const domains = Array.isArray(analysis.domains) ? analysis.domains : [];
     const lawHints = Array.isArray(analysis.lawHints) ? analysis.lawHints : [];
 
-    // Whitelist meta-history questions (these should NOT be treated as non-legal)
     const metaPatterns = [
       'резюмирай',
       'обобщи',
@@ -206,27 +179,15 @@ export class LegalService {
     ];
 
     const lowerQ = (userQuestion || '').toLowerCase();
-
     const isMeta = metaPatterns.some((p) => lowerQ.includes(p));
-
     if (isMeta) return false;
 
     const noLawHints = lawHints.length === 0;
-
     const noUsefulDomains =
       domains.length === 0 ||
       domains.every((d) =>
-        ['other', 'general', 'chitchat', 'smalltalk'].includes(
-          d.toLowerCase(),
-        ),
+        ['other', 'general', 'chitchat', 'smalltalk'].includes(d.toLowerCase()),
       );
-
-    this.logger.debug(
-      `isLikelyNonLegal(): result=${noLawHints && noUsefulDomains}, ` +
-        `domains=${JSON.stringify(domains)}, ` +
-        `lawHints=${JSON.stringify(lawHints)}, ` +
-        `userQuestionPreview=${(userQuestion || '').slice(0, 80)}`,
-    );
 
     return noLawHints && noUsefulDomains;
   }
@@ -235,17 +196,6 @@ export class LegalService {
   // 💡 Main AIAdvocate pipeline (Postgres + pgvector)
   // ---------------------------------------------------------------------------
 
-  /**
-   * Main entry point for AIAdvocate legal reasoning using Postgres + pgvector.
-   *
-   * Pipeline:
-   * 1) AI-based question analysis (domains + lawHints)
-   * 2) Law selection (tier-aware)
-   * 3) Tiered vector search per law
-   * 4) Optional global fallback
-   * 5) Context construction
-   * 6) LLM answer
-   */
   async chatWithPg(
     question: string,
     options?: { tier?: Tier; domainHint?: string; history?: ChatTurn[] },
@@ -253,16 +203,8 @@ export class LegalService {
     const tier = options?.tier ?? 'free';
     const tierConfig = this.getTierConfig(tier);
 
-    // 🟢 Step 0: евтин класификатор (legal / meta / non-legal)
     const category = await this.aiService.classifyQuestionKind(question);
-    this.logger.debug(
-      `chatWithPg(): question="${question.slice(
-        0,
-        80,
-      )}", classifiedCategory=${category}`,
-    );
 
-    // 0a) Нелегален (smalltalk, глупости и т.н.) → режем веднага, без вектори
     if (category === 'non-legal') {
       const answer =
         'AIAdvocate е правен асистент и е създаден да помага само по въпроси, ' +
@@ -285,19 +227,13 @@ export class LegalService {
       };
     }
 
-    // 0b) Мета-въпроси („Резюмирай…“, „Какво обсъждахме…“) –
-    //      не правим правен анализ, а чисто резюме на разговора.
     if (category === 'meta') {
       const history = options?.history ?? [];
-
-      // Тук ползваме големия модел, но без вектори. Историята е в ChatTurn[].
       const metaAnswer = await this.aiService.generateAnswer(
         'Потребителят иска накратко обобщение на досегашния разговор. ' +
-        'Направи кратко, ясно резюме на български, без нови правни теми.',
+          'Направи кратко, ясно резюме на български, без нови правни теми.',
         [],
-        {
-          history,
-        },
+        { history },
       );
 
       return {
@@ -313,26 +249,14 @@ export class LegalService {
       };
     }
 
-    // 🟢 Ако сме тук → category === 'legal' → продължаваме със стария pipeline
-    // 1) AI analysis
+    // legal
     const aiAnalysis = await this.aiService.analyzeLegalQuestion(question);
     const mergedAnalysis = this.mergeAnalysisWithHint(
       aiAnalysis,
       options?.domainHint,
     );
 
-    this.logger.debug(
-      `chatWithPg(): analysis for question="${question.slice(0, 80)}", ` +
-      `domains=${JSON.stringify(mergedAnalysis.domains ?? [])}, ` +
-      `lawHints=${JSON.stringify(mergedAnalysis.lawHints ?? [])}`,
-    );
-
-    // 👇 оставяш / ползваш isLikelyNonLegal ако искаш втори слой филтър.
     if (this.isLikelyNonLegal(mergedAnalysis, question)) {
-      this.logger.debug(
-        `chatWithPg(): isLikelyNonLegal()=true, въпреки че classifier върна legal – показваме guardrail.`,
-      );
-
       const answer =
         'AIAdvocate е правен асистент и е създаден да помага само по въпроси, ' +
         'свързани с българското право.\n\n' +
@@ -354,29 +278,33 @@ export class LegalService {
       };
     }
 
-    // 2) Law selection
+    // 2) Law selection (✅ via LawSelectorService)
     const allLaws = await this.pgLegalRepo.listLaws();
-    const candidateLaws = this.selectCandidateLaws(
+    const candidateLaws = this.lawSelector.selectCandidateLaws(
       allLaws,
       mergedAnalysis,
-      tierConfig,
+      {
+        maxLaws: tierConfig.maxLaws,
+      },
     );
 
-    // 3) Tiered vector search
+    // 3) Tiered vector search (✅ diversified, per-law caps, max laws, real fallback)
     const chunks = await this.searchChunksTiered(
       question,
       candidateLaws,
       tierConfig,
     );
 
-    // 4) Build context for LLM
+    // 4) Context
     const contextItems = this.buildAiContextItems(chunks);
 
-    // 5) Get final answer
+    // 5) Answer
     const aiAnswer = await this.aiService.generateAnswer(
       question,
       contextItems,
-      { history: options?.history },
+      {
+        history: options?.history,
+      },
     );
 
     return {
@@ -391,9 +319,6 @@ export class LegalService {
       answer: aiAnswer,
     };
   }
-  // ---------------------------------------------------------------------------
-  // 🔍 Merge AI analysis with optional UI domain hint
-  // ---------------------------------------------------------------------------
 
   private mergeAnalysisWithHint(
     aiAnalysis: LegalQuestionAnalysis,
@@ -406,136 +331,122 @@ export class LegalService {
       ? aiAnalysis.lawHints
       : [];
 
-    if (domainHint) {
-      domains.add(domainHint);
-    }
+    if (domainHint) domains.add(domainHint);
 
-    return {
-      domains: Array.from(domains),
-      lawHints,
-    };
+    return { domains: Array.from(domains), lawHints };
   }
-
-  // ---------------------------------------------------------------------------
-  // 📚 Law selection based on AI lawHints + light boosting
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Choose a small set of candidate laws based on:
-   * - AI-proposed law names (lawHints)
-   * - light boosts for always-relevant laws (e.g. ZANN, APK, Constitution)
-   *
-   * NOTE: We only use LawRow fields that actually exist in the DB:
-   *   id, ldoc_id, law_title, list_title, source_url
-   */
-  private selectCandidateLaws(
-    allLaws: LawRow[],
-    analysis: LegalQuestionAnalysis,
-    tierConfig: TierConfig,
-  ): LawRow[] {
-    const { lawHints = [] } = analysis;
-    const maxLaws = tierConfig.maxLaws;
-
-    const normalizedHints = lawHints.map((h) => h.toLowerCase());
-
-    const scored = allLaws.map((law) => {
-      const title = `${law.law_title} ${law.list_title}`.toLowerCase();
-      let score = 0;
-
-      // 1) Direct text match with lawHints (main signal)
-      for (const hint of normalizedHints) {
-        if (!hint) continue;
-        if (title.includes(hint)) {
-          score += 80; // strong match
-        }
-      }
-
-      // 2) Light boost for always-relevant laws
-      if (title.includes('конституция на република българия')) {
-        score += 5;
-      }
-      if (title.includes('административните нарушения и наказания')) {
-        score += 5; // ЗАНН
-      }
-      if (title.includes('административнопроцесуален кодекс')) {
-        score += 5; // АПК
-      }
-
-      return { law, score };
-    });
-
-    // Keep only positive score
-    const positive = scored.filter((s) => s.score > 0);
-
-    // Sort by score desc, then by id asc as a stable tiebreaker
-    positive.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return a.law.id - b.law.id;
-    });
-
-    let selected: LawRow[];
-
-    if (positive.length > 0) {
-      selected = positive.slice(0, maxLaws).map((s) => s.law);
-    } else {
-      // Fallback: if no matches at all (rare),
-      // just take the first N laws by id so the system still works.
-      selected = [...allLaws]
-        .sort((a, b) => a.id - b.id)
-        .slice(0, maxLaws);
-    }
-
-    return selected;
-  }
-
-  // ---------------------------------------------------------------------------
-  // 🔎 Tiered vector search over chunks
-  // ---------------------------------------------------------------------------
 
   private async searchChunksTiered(
     question: string,
     candidateLaws: LawRow[],
     cfg: TierConfig,
   ): Promise<LawChunkRow[]> {
-    // 1) Rewrite question into better search query
     const rewritten = await this.aiService.rewriteLegalSearchQuery(question);
-
-    // 2) Embed
     const embedding = await this.embeddingsService.embed(rewritten);
 
-    const results: LawChunkRow[] = [];
+    const lawIds = candidateLaws.map((l) => l.id);
 
-    // 3) Per-law vector search
-    for (const law of candidateLaws) {
-      const subset = (await this.pgLegalRepo.findChunksByEmbedding(
-        embedding,
-        cfg.perLawLimit,
-        law.id,
-      )) as LawChunkRow[];
+    // 1) Oversample from candidate laws in one batch
+    // Oversample hard so we have enough variety to round-robin.
+    const oversample = Math.max(
+      cfg.perLawLimit * Math.max(1, lawIds.length) * 3,
+      cfg.globalFallbackLimit,
+    );
 
-      results.push(...subset);
-    }
+    const raw = await this.pgLegalRepo.findChunksByEmbeddingForLaws(
+      embedding,
+      oversample,
+      lawIds.length ? lawIds : undefined,
+    );
 
-    // 4) Global fallback if too few results
-    if (results.length < 3 && cfg.globalFallbackLimit > 0) {
-      const global = (await this.pgLegalRepo.findChunksByEmbedding(
+    // 2) Diversify + cap per law and max laws (candidate priority)
+    let picked = this.diversifyChunks(
+      raw,
+      cfg.perLawLimit,
+      cfg.maxLaws,
+      lawIds,
+    );
+
+    // 3) Fallback if too few results OR too few distinct laws
+    const distinctPickedLaws = new Set(picked.map((c) => c.law_id)).size;
+    const wantLaws = Math.min(cfg.maxLaws, lawIds.length || cfg.maxLaws);
+
+    const needMore =
+      picked.length < cfg.perLawLimit ||
+      distinctPickedLaws < Math.min(2, wantLaws);
+
+    if (needMore && cfg.globalFallbackLimit > 0) {
+      const globalRaw = await this.pgLegalRepo.findChunksByEmbeddingForLaws(
         embedding,
         cfg.globalFallbackLimit,
         undefined,
-      )) as LawChunkRow[];
-      results.push(...global);
+      );
+
+      // Merge + diversify again, but KEEP candidate order preference
+      const merged = [...picked, ...globalRaw];
+      picked = this.diversifyChunks(
+        merged,
+        cfg.perLawLimit,
+        cfg.maxLaws,
+        lawIds,
+      );
     }
 
-    return results;
+    return picked;
   }
 
-  // ---------------------------------------------------------------------------
-  // 🧱 Context construction for LLM
-  // ---------------------------------------------------------------------------
+  private diversifyChunks(
+    chunks: LawChunkRow[],
+    perLawLimit: number,
+    maxLaws: number,
+    preferredLawOrder?: number[],
+  ): LawChunkRow[] {
+    // sort by score (closest first)
+    const sorted = [...chunks].sort((a, b) => a.score - b.score);
+
+    // group by law_id
+    const byLaw = new Map<number, LawChunkRow[]>();
+    for (const c of sorted) {
+      if (!byLaw.has(c.law_id)) byLaw.set(c.law_id, []);
+      byLaw.get(c.law_id)!.push(c);
+    }
+
+    // choose iteration order: candidate laws first, then any others
+    const candidateOrder =
+      preferredLawOrder?.filter((id) => byLaw.has(id)) ?? [];
+    const otherOrder = Array.from(byLaw.keys()).filter(
+      (id) => !candidateOrder.includes(id),
+    );
+
+    const lawOrder = [...candidateOrder, ...otherOrder].slice(0, maxLaws);
+
+    // round-robin pick with per-law caps
+    const picked: LawChunkRow[] = [];
+    const usedPerLaw = new Map<number, number>();
+
+    let progress = true;
+    while (progress) {
+      progress = false;
+
+      for (const lawId of lawOrder) {
+        const used = usedPerLaw.get(lawId) ?? 0;
+        if (used >= perLawLimit) continue;
+
+        const arr = byLaw.get(lawId);
+        if (!arr || arr.length === 0) continue;
+
+        picked.push(arr.shift()!);
+        usedPerLaw.set(lawId, used + 1);
+        progress = true;
+      }
+    }
+
+    return picked;
+  }
 
   private buildAiContextItems(chunks: LawChunkRow[]): AiContextItem[] {
     return chunks.map((c) => ({
-      citation: `${c.law_title} – ${c.list_title} (ldoc: ${c.law_id}, chunk ${c.chunk_index})`,
+      citation: `${c.law_title} – ${c.list_title} (ldoc: ${c.ldoc_id}, chunk ${c.chunk_index})`,
       text: c.chunk_text,
     }));
   }

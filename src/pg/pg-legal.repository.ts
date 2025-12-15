@@ -1,4 +1,3 @@
-// src/legal/pg/pg-legal.repository.ts
 import { Inject, Injectable } from '@nestjs/common';
 import { Pool } from 'pg';
 import { toSql } from 'pgvector';
@@ -28,6 +27,7 @@ export class PgLegalRepository {
   constructor(
     @Inject('PG_POOL')
     private readonly pool: Pool,
+    @Inject('LOGGER_SERVICE') private readonly logger: any,
   ) {}
 
   /**
@@ -84,24 +84,111 @@ export class PgLegalRepository {
     }
 
     const sql = `
-      SELECT
-        lc.id,
-        lc.law_id,
-        lc.chunk_index,
-        lc.chunk_text,
-        l.law_title,
-        l.list_title,
-        l.source_url,
-        l.ldoc_id,
-        (lc.embedding <=> $1::vector) AS score
-      FROM law_chunks lc
-      JOIN laws l ON l.id = lc.law_id
-      ${whereClause}
-      ORDER BY lc.embedding <=> $1::vector
-      LIMIT $2;
-    `;
+    SELECT
+      lc.id,
+      lc.law_id,
+      lc.chunk_index,
+      lc.chunk_text,
+      l.law_title,
+      l.list_title,
+      l.source_url,
+      l.ldoc_id,
+      (lc.embedding <=> $1::vector) AS score
+    FROM law_chunks lc
+    JOIN laws l ON l.id = lc.law_id
+    ${whereClause}
+    ORDER BY lc.embedding <=> $1::vector
+    LIMIT $2;
+  `;
 
+    const t0 = Date.now();
     const res = await this.pool.query<LawChunkRow>(sql, params);
+    const ms = Date.now() - t0;
+
+    // ✅ actionable log (after res/ms exist)
+    this.logger?.log?.(
+      `[PG][vector] ms=${ms} rows=${res.rowCount} lawId=${lawId ?? 'ALL'} limit=${limit}`,
+    );
+
+    // Optional: if slow, run explain occasionally (guarded by env var)
+    const explainEnabled = process.env.PG_EXPLAIN_VECTOR === '1';
+    const slowThreshold = +(process.env.PG_SLOW_MS || 250);
+
+    if (explainEnabled && ms >= slowThreshold) {
+      try {
+        const explainSql = `EXPLAIN (ANALYZE, BUFFERS) ${sql}`;
+        const ex = await this.pool.query(explainSql, params);
+        const plan = ex.rows.map((r: any) => r['QUERY PLAN']).join('\n');
+
+        this.logger?.warn?.(`[PG][vector][EXPLAIN] slow ms=${ms}\n${plan}`);
+      } catch (e: any) {
+        this.logger?.error?.(
+          `[PG][vector][EXPLAIN] failed: ${e?.message || e}`,
+          e?.stack,
+        );
+      }
+    }
+
+    return res.rows;
+  }
+
+  async findChunksByEmbeddingForLaws(
+    embedding: number[],
+    limit: number,
+    lawIds?: number[],
+  ): Promise<LawChunkRow[]> {
+    const embeddingLiteral = toSql(embedding);
+
+    const hasLawIds = Array.isArray(lawIds) && lawIds.length > 0;
+
+    const sqlAll = `
+    SELECT
+      lc.id,
+      lc.law_id,
+      lc.chunk_index,
+      lc.chunk_text,
+      l.law_title,
+      l.list_title,
+      l.source_url,
+      l.ldoc_id,
+      (lc.embedding <=> $1::vector) AS score
+    FROM law_chunks lc
+    JOIN laws l ON l.id = lc.law_id
+    ORDER BY lc.embedding <=> $1::vector
+    LIMIT $2;
+  `;
+
+    const sqlFiltered = `
+    SELECT
+      lc.id,
+      lc.law_id,
+      lc.chunk_index,
+      lc.chunk_text,
+      l.law_title,
+      l.list_title,
+      l.source_url,
+      l.ldoc_id,
+      (lc.embedding <=> $1::vector) AS score
+    FROM law_chunks lc
+    JOIN laws l ON l.id = lc.law_id
+    WHERE lc.law_id = ANY($3::int[])
+    ORDER BY lc.embedding <=> $1::vector
+    LIMIT $2;
+  `;
+
+    const sql = hasLawIds ? sqlFiltered : sqlAll;
+    const params = hasLawIds
+      ? [embeddingLiteral, limit, lawIds]
+      : [embeddingLiteral, limit];
+
+    const t0 = Date.now();
+    const res = await this.pool.query<LawChunkRow>(sql, params);
+    const ms = Date.now() - t0;
+
+    this.logger?.log?.(
+      `[PG][vector][BATCH] ms=${ms} rows=${res.rowCount} laws=${hasLawIds ? lawIds!.length : 'ALL'} limit=${limit}`,
+    );
+
     return res.rows;
   }
 }
