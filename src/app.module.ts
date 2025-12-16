@@ -14,6 +14,8 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthUser } from './auth/auth-user.entity';
 import { ProceduresModule } from './procedures/procedures.module';
 import { DocumentsModule } from './documents/documents.module';
+import { IngestionModule } from './ingestion/ingestion.module';
+
 
 @Module({
   imports: [
@@ -42,6 +44,7 @@ import { DocumentsModule } from './documents/documents.module';
     AuthModule,
     ProceduresModule,
     DocumentsModule,
+    IngestionModule
   ],
   controllers: [AppController],
   providers: [AppService],

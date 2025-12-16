@@ -8,6 +8,10 @@ export interface LawRow {
   law_title: string;
   list_title: string;
   source_url: string;
+  content_hash: string | null;
+  scraped_at: string | null;
+  chunked_at: string | null;
+  embedded_at: string | null;
 }
 
 export interface LawChunkRow {
@@ -30,9 +34,6 @@ export class PgLegalRepository {
     @Inject('LOGGER_SERVICE') private readonly logger: any,
   ) {}
 
-  /**
-   * Simple stats for monitoring / progress.
-   */
   async getStats(): Promise<{ laws: number; chunks: number }> {
     const [lawsRes, chunksRes] = await Promise.all([
       this.pool.query<{ count: number }>(
@@ -49,12 +50,9 @@ export class PgLegalRepository {
     };
   }
 
-  /**
-   * List all laws (for dropdowns, filters, etc.).
-   */
   async listLaws(): Promise<LawRow[]> {
     const sql = `
-      SELECT id, ldoc_id, law_title, list_title, source_url
+      SELECT id, ldoc_id, law_title, list_title, source_url, content_hash, scraped_at, chunked_at, embedded_at
       FROM laws
       ORDER BY law_title;
     `;
@@ -62,13 +60,101 @@ export class PgLegalRepository {
     return res.rows;
   }
 
-  /**
-   * Vector similarity search over law_chunks with optional filter by law_id.
-   *
-   * @param embedding numerical embedding (same dim as pgvector column)
-   * @param limit max rows to return
-   * @param lawId optional law_id filter
-   */
+  // ---------------------------
+  // Ingestion helpers
+  // ---------------------------
+
+  async getLawByLdocId(ldocId: string): Promise<LawRow | null> {
+    const res = await this.pool.query<LawRow>(
+      `
+      SELECT id, ldoc_id, law_title, list_title, source_url, content_hash, scraped_at, chunked_at, embedded_at
+      FROM laws
+      WHERE ldoc_id = $1
+      LIMIT 1;
+      `,
+      [ldocId],
+    );
+    return res.rows[0] ?? null;
+  }
+
+  async upsertLawForIngestion(input: {
+    ldocId: string;
+    listTitle: string;
+    lawTitle: string;
+    sourceUrl: string;
+    contentHash: string;
+  }): Promise<number> {
+    const res = await this.pool.query<{ id: number }>(
+      `
+      INSERT INTO laws (ldoc_id, list_title, law_title, source_url, content_hash, scraped_at)
+      VALUES ($1, $2, $3, $4, $5, now())
+      ON CONFLICT (ldoc_id) DO UPDATE
+        SET list_title   = EXCLUDED.list_title,
+            law_title    = EXCLUDED.law_title,
+            source_url   = EXCLUDED.source_url,
+            content_hash = EXCLUDED.content_hash,
+            scraped_at   = now()
+      RETURNING id;
+      `,
+      [
+        input.ldocId,
+        input.listTitle,
+        input.lawTitle,
+        input.sourceUrl,
+        input.contentHash,
+      ],
+    );
+    return res.rows[0].id;
+  }
+
+  async replaceLawChunks(lawId: number, chunks: { index: number; text: string; embedding: number[] }[]): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('DELETE FROM law_chunks WHERE law_id = $1;', [lawId]);
+      await client.query('UPDATE laws SET chunked_at = now(), embedded_at = NULL WHERE id = $1;', [lawId]);
+
+      if (chunks.length > 0) {
+        // Insert in batches to avoid gigantic SQL packets
+        const BATCH = 200;
+
+        for (let start = 0; start < chunks.length; start += BATCH) {
+          const batch = chunks.slice(start, start + BATCH);
+
+          const valuesSql: string[] = [];
+          const params: any[] = [];
+          let p = 1;
+
+          for (const c of batch) {
+            const embLiteral = toSql(c.embedding); // e.g. '[0.1,0.2,...]'
+            valuesSql.push(`($${p++}, $${p++}, $${p++}, $${p++}::vector)`);
+            params.push(lawId, c.index, c.text, embLiteral);
+          }
+
+          await client.query(
+            `
+            INSERT INTO law_chunks (law_id, chunk_index, chunk_text, embedding)
+            VALUES ${valuesSql.join(', ')};
+            `,
+            params,
+          );
+        }
+      }
+
+      await client.query('UPDATE laws SET embedded_at = now() WHERE id = $1;', [lawId]);
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  // ---------------------------
+  // Your existing vector search
+  // ---------------------------
+
   async findChunksByEmbedding(
     embedding: number[],
     limit = 10,
@@ -79,9 +165,7 @@ export class PgLegalRepository {
     const params: any[] = [embeddingLiteral, limit];
 
     const whereClause = lawId ? 'WHERE lc.law_id = $3' : '';
-    if (lawId) {
-      params.push(lawId);
-    }
+    if (lawId) params.push(lawId);
 
     const sql = `
     SELECT
@@ -105,12 +189,10 @@ export class PgLegalRepository {
     const res = await this.pool.query<LawChunkRow>(sql, params);
     const ms = Date.now() - t0;
 
-    // ✅ actionable log (after res/ms exist)
     this.logger?.log?.(
       `[PG][vector] ms=${ms} rows=${res.rowCount} lawId=${lawId ?? 'ALL'} limit=${limit}`,
     );
 
-    // Optional: if slow, run explain occasionally (guarded by env var)
     const explainEnabled = process.env.PG_EXPLAIN_VECTOR === '1';
     const slowThreshold = +(process.env.PG_SLOW_MS || 250);
 
@@ -138,7 +220,6 @@ export class PgLegalRepository {
     lawIds?: number[],
   ): Promise<LawChunkRow[]> {
     const embeddingLiteral = toSql(embedding);
-
     const hasLawIds = Array.isArray(lawIds) && lawIds.length > 0;
 
     const sqlAll = `
