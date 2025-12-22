@@ -26,6 +26,13 @@ export interface LawChunkRow {
   score: number; // smaller = closer (pgvector <=>)
 }
 
+export type LawRegistryRow = {
+  ldoc_id: string;
+  title: string;
+  source_url: string;
+  last_content_hash: string | null;
+};
+
 @Injectable()
 export class PgLegalRepository {
   constructor(
@@ -58,6 +65,69 @@ export class PgLegalRepository {
     `;
     const res = await this.pool.query<LawRow>(sql);
     return res.rows;
+  }
+
+  // ---------------------------
+  // Registry helpers (NEW)
+  // ---------------------------
+
+  /**
+   * Returns registry docs that are worth trying to ingest.
+   *
+   * IMPORTANT: do NOT require scraped=true yet, because right now you are not
+   * writing scraped=true anywhere. We’ll wire that later from the scraper.
+   */
+  async listRegistryToIngest(limit = 1): Promise<LawRegistryRow[]> {
+    const sql = `
+      SELECT ldoc_id, title, source_url, last_content_hash
+      FROM law_registry
+      WHERE expected = true
+        AND (
+          ingested = false
+          OR embedded = false
+          OR last_ingested_at IS NULL
+          OR last_error IS NOT NULL
+        )
+      ORDER BY
+        -- brand new first
+        (CASE WHEN last_ingested_at IS NULL THEN 0 ELSE 1 END) ASC,
+        -- retry oldest ingested first (so we eventually cover everything)
+        last_ingested_at ASC NULLS FIRST,
+        -- stable tiebreaker
+        ldoc_id ASC
+      LIMIT $1;
+    `;
+
+    const res = await this.pool.query<LawRegistryRow>(sql, [limit]);
+    return res.rows;
+  }
+
+  async markRegistryIngestedOk(ldocId: string, contentHash: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE law_registry
+      SET ingested = true,
+          embedded = true,
+          last_content_hash = $2,
+          last_ingested_at = now(),
+          last_error = NULL,
+          updated_at = now()
+      WHERE ldoc_id = $1;
+      `,
+      [ldocId, contentHash],
+    );
+  }
+
+  async markRegistryIngestedError(ldocId: string, err: string): Promise<void> {
+    await this.pool.query(
+      `
+      UPDATE law_registry
+      SET last_error = $2,
+          updated_at = now()
+      WHERE ldoc_id = $1;
+      `,
+      [ldocId, err],
+    );
   }
 
   // ---------------------------
@@ -107,15 +177,20 @@ export class PgLegalRepository {
     return res.rows[0].id;
   }
 
-  async replaceLawChunks(lawId: number, chunks: { index: number; text: string; embedding: number[] }[]): Promise<void> {
+  async replaceLawChunks(
+    lawId: number,
+    chunks: { index: number; text: string; embedding: number[] }[],
+  ): Promise<void> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
       await client.query('DELETE FROM law_chunks WHERE law_id = $1;', [lawId]);
-      await client.query('UPDATE laws SET chunked_at = now(), embedded_at = NULL WHERE id = $1;', [lawId]);
+      await client.query(
+        'UPDATE laws SET chunked_at = now(), embedded_at = NULL WHERE id = $1;',
+        [lawId],
+      );
 
       if (chunks.length > 0) {
-        // Insert in batches to avoid gigantic SQL packets
         const BATCH = 200;
 
         for (let start = 0; start < chunks.length; start += BATCH) {
@@ -126,7 +201,7 @@ export class PgLegalRepository {
           let p = 1;
 
           for (const c of batch) {
-            const embLiteral = toSql(c.embedding); // e.g. '[0.1,0.2,...]'
+            const embLiteral = toSql(c.embedding);
             valuesSql.push(`($${p++}, $${p++}, $${p++}, $${p++}::vector)`);
             params.push(lawId, c.index, c.text, embLiteral);
           }
@@ -141,7 +216,9 @@ export class PgLegalRepository {
         }
       }
 
-      await client.query('UPDATE laws SET embedded_at = now() WHERE id = $1;', [lawId]);
+      await client.query('UPDATE laws SET embedded_at = now() WHERE id = $1;', [
+        lawId,
+      ]);
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK');
@@ -152,7 +229,7 @@ export class PgLegalRepository {
   }
 
   // ---------------------------
-  // Your existing vector search
+  // Vector search
   // ---------------------------
 
   async findChunksByEmbedding(

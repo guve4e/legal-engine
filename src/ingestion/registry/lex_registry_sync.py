@@ -7,8 +7,10 @@ from typing import List, Dict, Optional, Tuple, Set
 import re
 import time
 import os
+
 import requests
 import psycopg2
+from psycopg2.extras import execute_batch
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
@@ -19,8 +21,8 @@ from urllib.parse import urljoin
 
 LEX_BASE = "https://lex.bg"
 
-# ✅ Tree indexes (source-of-truth catalog pages)
-# doc_type MUST match your Postgres CHECK constraint values
+# Tree indexes (source-of-truth catalog pages)
+# IMPORTANT: doc_type MUST match your Postgres CHECK constraint values.
 INDEX_PAGES: List[Tuple[str, str]] = [
     ("https://lex.bg/laws/tree/laws", "LAW"),
     ("https://lex.bg/laws/tree/codes", "KODEKS"),
@@ -43,6 +45,14 @@ HEADERS = {
 SLEEP_SECONDS = float(os.getenv("LEX_REGISTRY_SLEEP", "0.8"))
 MAX_PAGES_PER_INDEX = int(os.getenv("LEX_REGISTRY_MAX_PAGES", "800"))
 MISSING_AFTER_DAYS = int(os.getenv("LEX_REGISTRY_MISSING_DAYS", "7"))
+
+# Keep this synced with your DB CHECK constraint.
+# If DB constraint differs, change these strings (or query the DB and build this dynamically).
+ALLOWED_DOC_TYPES: Set[str] = {"LAW", "KODEKS", "NAREDBA", "PRAVILNIK"}
+
+# If doc_type is not allowed (due to mismatch in DB constraint), map to something safe.
+# You can also choose to "skip" instead of fallback.
+DOC_TYPE_FALLBACK = "LAW"
 
 RegistryEntry = Dict[str, Optional[str]]
 
@@ -75,29 +85,35 @@ def build_paged_url(base_url: str, page: int) -> str:
 # PARSE
 # -------------------------
 
+# Matches both /ldoc/<id> and /laws/ldoc/<id>
 LDOC_RE = re.compile(r"/ldoc/(\d+)")
 
 
-def normalize_doc_type(title: str, doc_type: str) -> str:
+def normalize_doc_type(index_doc_type: str) -> Optional[str]:
     """
-    Lex tree categories are mostly correct, but there are exceptions.
-    Keep DB constraint strict; fix exceptions here.
+    Keep DB strict. Only allow doc types that pass DB CHECK constraint.
+    If mismatch, fallback (or return None to skip).
     """
-    t = (title or "").strip().lower()
+    dt = (index_doc_type or "").strip().upper()
+    if dt in ALLOWED_DOC_TYPES:
+        return dt
 
-    # Конституция is NOT a "KODEKS" even if Lex shows it under codes.
-    if "конституц" in t:
-        return "LAW"
-
-    return doc_type
+    # fallback instead of crashing the run
+    # (or return None to skip unknown types)
+    return DOC_TYPE_FALLBACK
 
 
 def parse_index(html: str, doc_type: str) -> List[RegistryEntry]:
     soup = BeautifulSoup(html, "html.parser")
     entries: List[RegistryEntry] = []
 
-    # Keep selector narrow and predictable
-    for a in soup.select("a[href*='/ldoc/']"):
+    final_doc_type = normalize_doc_type(doc_type)
+    if not final_doc_type:
+        print(f"  !! doc_type={doc_type} not allowed and no fallback; skipping this index page.")
+        return entries
+
+    # Broad but safe: only anchors containing 'ldoc' and matching digits
+    for a in soup.select("a[href*='ldoc']"):
         href = (a.get("href") or "").strip()
         title = a.get_text(strip=True)
 
@@ -110,8 +126,6 @@ def parse_index(html: str, doc_type: str) -> List[RegistryEntry]:
 
         ldoc_id = m.group(1)
         source_url = urljoin(LEX_BASE, href)
-
-        final_doc_type = normalize_doc_type(title, doc_type)
 
         entries.append({
             "ldoc_id": ldoc_id,
@@ -168,24 +182,35 @@ def upsert_registry(entries: List[RegistryEntry]) -> None:
         print("No entries to upsert.")
         return
 
+    # Filter any bad doc_type defensively (shouldn’t happen due to normalize_doc_type)
+    good: List[RegistryEntry] = []
+    skipped = 0
+    for e in entries:
+        dt = (e.get("doc_type") or "").upper()
+        if dt not in ALLOWED_DOC_TYPES:
+            skipped += 1
+            continue
+        good.append(e)
+
+    if skipped:
+        print(f"  !! skipped {skipped} entries due to invalid doc_type")
+
     conn = psycopg2.connect(**PG_CONFIG)
     cur = conn.cursor()
-
     try:
-        for e in entries:
-            cur.execute(UPSERT_SQL, e)
+        # faster than loop execute()
+        execute_batch(cur, UPSERT_SQL, good, page_size=500)
         conn.commit()
     finally:
         cur.close()
         conn.close()
 
-    print(f"✅ Upserted {len(entries)} registry entries")
+    print(f"✅ Upserted {len(good)} registry entries")
 
 
 def mark_missing() -> None:
     conn = psycopg2.connect(**PG_CONFIG)
     cur = conn.cursor()
-
     try:
         cur.execute(
             f"""
@@ -201,7 +226,7 @@ def mark_missing() -> None:
         cur.close()
         conn.close()
 
-    print(f"✅ Marked {affected} registry entries as not expected")
+    print(f"✅ Marked {affected} registry entries as not expected (> {MISSING_AFTER_DAYS} days)")
 
 
 # -------------------------
