@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 # src/ingestion/registry/lex_registry_sync.py
 
 from __future__ import annotations
