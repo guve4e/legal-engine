@@ -86,7 +86,7 @@ def build_paged_url(base_url: str, page: int) -> str:
 # -------------------------
 
 # Matches both /ldoc/<id> and /laws/ldoc/<id>
-LDOC_RE = re.compile(r"/ldoc/(\d+)")
+LDOC_RE = re.compile(r"/ldoc/(-?\d+)")
 
 
 def normalize_doc_type(index_doc_type: str) -> Optional[str]:
