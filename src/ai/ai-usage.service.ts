@@ -42,25 +42,32 @@ export class AiUsageService {
    * Rough pricing calculator – update values if OpenAI prices change.
    * All prices are USD per 1M tokens.
    */
-  computeCostUsd(
-    model: string,
-    inputTokens: number,
-    outputTokens: number,
-  ): number | null {
-    const pricingPer1M: Record<string, { input: number; output: number }> = {
+  computeCostUsd(model: string, inputTokens: number, outputTokens: number): number | null {
+    // USD per 1M tokens
+    const chatPricingPer1M: Record<string, { input: number; output: number }> = {
       'gpt-4.1-mini': { input: 0.15, output: 0.6 },
       'gpt-4o-mini': { input: 0.15, output: 0.6 },
-      // fallback
       default: { input: 0.15, output: 0.6 },
     };
 
-    const p = pricingPer1M[model] ?? pricingPer1M.default;
+    // embeddings are input-only pricing
+    const embedPricingPer1M: Record<string, { input: number }> = {
+      'text-embedding-3-small': { input: 0.02 },
+      'text-embedding-3-large': { input: 0.13 },
+    };
 
+    if (model in embedPricingPer1M) {
+      const p = embedPricingPer1M[model];
+      const total = (inputTokens / 1_000_000) * p.input;
+      if (!isFinite(total) || total <= 0) return null;
+      return Number(total.toFixed(6));
+    }
+
+    const p = chatPricingPer1M[model] ?? chatPricingPer1M.default;
     const inputCost = (inputTokens / 1_000_000) * p.input;
     const outputCost = (outputTokens / 1_000_000) * p.output;
-
     const total = inputCost + outputCost;
-    if (!isFinite(total) || total === 0) return null;
+    if (!isFinite(total) || total <= 0) return null;
     return Number(total.toFixed(6));
   }
 
