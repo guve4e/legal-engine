@@ -1,5 +1,5 @@
 // src/ingestion/openai-embeddings.service.ts
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { OpenAI } from 'openai';
 import { AiUsageService } from '../ai/ai-usage.service';
 
@@ -8,7 +8,7 @@ export class OpenAiEmbeddingsService {
   private readonly logger = new Logger(OpenAiEmbeddingsService.name);
 
   constructor(
-    private readonly openai: OpenAI,              // ✅ use injected singleton
+    private readonly client: OpenAI,
     private readonly aiUsage: AiUsageService,     // ✅ meter usage
   ) {}
 
@@ -26,7 +26,7 @@ export class OpenAiEmbeddingsService {
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const resp = await this.openai.embeddings.create({ model, input });
+        const resp = await this.client.embeddings.create({ model, input });
 
         // ✅ meter usage if available
         const usage = (resp as any).usage;

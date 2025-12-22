@@ -28,6 +28,6 @@ import { OpenAI } from 'openai';
     AiService,
     AiUsageService,
   ],
-  exports: [AiService, AiUsageService],
+  exports: [OpenAI, AiService, AiUsageService],
 })
 export class AiModule {}
