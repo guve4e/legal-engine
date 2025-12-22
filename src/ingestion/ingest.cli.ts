@@ -1,3 +1,4 @@
+// src/ingestion/ingest.cli.ts
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
@@ -17,17 +18,22 @@ async function main() {
   try {
     const ingestion = app.get(IngestionService);
 
-    const dir = getArg('dir') ?? process.env.LEX_LAWS_PARSED_DIR;
-    const maxDocs = getArg('maxDocs')
-      ? Number(getArg('maxDocs'))
-      : undefined;
+    const parsedDir =
+      getArg('dir') ??
+      getArg('parsedDir') ??
+      process.env.LEX_LAWS_PARSED_DIR;
+
+    const maxDocs = getArg('maxDocs') ? Number(getArg('maxDocs')) : undefined;
+
     const maxCharsPerChunk = getArg('maxCharsPerChunk')
       ? Number(getArg('maxCharsPerChunk'))
       : undefined;
+
     const model = getArg('model') ?? process.env.EMBEDDING_MODEL;
 
-    await ingestion.ingestDir({
-      dir,
+    // ✅ registry-driven ingestion
+    await ingestion.ingestFromRegistry({
+      parsedDir,
       maxDocs,
       maxCharsPerChunk,
       model,
