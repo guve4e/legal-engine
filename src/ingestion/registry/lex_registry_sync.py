@@ -23,11 +23,17 @@ LEX_BASE = "https://lex.bg"
 
 # Tree indexes (source-of-truth catalog pages)
 # IMPORTANT: doc_type MUST match your Postgres CHECK constraint values.
+# Your DB constraint allows: LAW, CODE, PRAVILNIK
 INDEX_PAGES: List[Tuple[str, str]] = [
     ("https://lex.bg/laws/tree/laws", "LAW"),
-    ("https://lex.bg/laws/tree/codes", "KODEKS"),
-    ("https://lex.bg/laws/tree/ordinances", "NAREDBA"),
+    ("https://lex.bg/laws/tree/codes", "CODE"),
     ("https://lex.bg/laws/tree/regs", "PRAVILNIK"),
+    # NOTE: ordinances is NOT supported by your DB constraint right now.
+    # If you want ordinances, either:
+    #   - expand DB constraint to include "NAREDBA", or
+    #   - map ordinances to LAW (but then you're lying about types).
+    # For now we exclude it so the pipeline doesn't break.
+    # ("https://lex.bg/laws/tree/ordinances", "NAREDBA"),
 ]
 
 PG_CONFIG = dict(
@@ -47,11 +53,7 @@ MAX_PAGES_PER_INDEX = int(os.getenv("LEX_REGISTRY_MAX_PAGES", "800"))
 MISSING_AFTER_DAYS = int(os.getenv("LEX_REGISTRY_MISSING_DAYS", "7"))
 
 # Keep this synced with your DB CHECK constraint.
-# If DB constraint differs, change these strings (or query the DB and build this dynamically).
-ALLOWED_DOC_TYPES: Set[str] = {"LAW", "KODEKS", "NAREDBA", "PRAVILNIK"}
-
-# If doc_type is not allowed (due to mismatch in DB constraint), map to something safe.
-# You can also choose to "skip" instead of fallback.
+ALLOWED_DOC_TYPES: Set[str] = {"LAW", "CODE", "PRAVILNIK"}
 DOC_TYPE_FALLBACK = "LAW"
 
 RegistryEntry = Dict[str, Optional[str]]
@@ -89,17 +91,34 @@ def build_paged_url(base_url: str, page: int) -> str:
 LDOC_RE = re.compile(r"/ldoc/(-?\d+)")
 
 
-def normalize_doc_type(index_doc_type: str) -> Optional[str]:
+def normalize_doc_type(raw: Optional[str]) -> str:
     """
-    Keep DB strict. Only allow doc types that pass DB CHECK constraint.
-    If mismatch, fallback (or return None to skip).
-    """
-    dt = (index_doc_type or "").strip().upper()
-    if dt in ALLOWED_DOC_TYPES:
-        return dt
+    Force lex doc types into the DB enum: LAW | CODE | PRAVILNIK
 
-    # fallback instead of crashing the run
-    # (or return None to skip unknown types)
+    This must NEVER return anything else, otherwise your registry sync crashes
+    due to the Postgres CHECK constraint.
+    """
+    if not raw:
+        return DOC_TYPE_FALLBACK
+
+    s = str(raw).strip().upper()
+
+    # already valid
+    if s in ALLOWED_DOC_TYPES:
+        return s
+
+    # common variants from lex or other sources
+    if s in ("KODEKS", "КОДЕКС", "KODEX"):
+        return "CODE"
+
+    # ordinances / naradba not supported by DB -> fallback
+    if s in ("NAREDBA", "НАРЕДБА", "ORDINANCE", "ORDINANCES"):
+        return DOC_TYPE_FALLBACK
+
+    # constitution isn't a code - keep it LAW
+    if "КОНСТИТУЦ" in s or "CONSTITUT" in s:
+        return "LAW"
+
     return DOC_TYPE_FALLBACK
 
 
@@ -108,9 +127,6 @@ def parse_index(html: str, doc_type: str) -> List[RegistryEntry]:
     entries: List[RegistryEntry] = []
 
     final_doc_type = normalize_doc_type(doc_type)
-    if not final_doc_type:
-        print(f"  !! doc_type={doc_type} not allowed and no fallback; skipping this index page.")
-        return entries
 
     # Broad but safe: only anchors containing 'ldoc' and matching digits
     for a in soup.select("a[href*='ldoc']"):
@@ -182,23 +198,31 @@ def upsert_registry(entries: List[RegistryEntry]) -> None:
         print("No entries to upsert.")
         return
 
-    # Filter any bad doc_type defensively (shouldn’t happen due to normalize_doc_type)
     good: List[RegistryEntry] = []
     skipped = 0
+
     for e in entries:
-        dt = (e.get("doc_type") or "").upper()
+        # enforce again defensively
+        dt = normalize_doc_type(e.get("doc_type"))
+        e["doc_type"] = dt
+
         if dt not in ALLOWED_DOC_TYPES:
             skipped += 1
             continue
+
+        # basic sanity
+        if not (e.get("ldoc_id") or "").strip():
+            skipped += 1
+            continue
+
         good.append(e)
 
     if skipped:
-        print(f"  !! skipped {skipped} entries due to invalid doc_type")
+        print(f"  !! skipped {skipped} entries due to invalid data/doc_type")
 
     conn = psycopg2.connect(**PG_CONFIG)
     cur = conn.cursor()
     try:
-        # faster than loop execute()
         execute_batch(cur, UPSERT_SQL, good, page_size=500)
         conn.commit()
     finally:
