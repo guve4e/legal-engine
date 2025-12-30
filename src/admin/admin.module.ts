@@ -9,21 +9,20 @@ import { PgModule } from '../pg/pg.module';
 import { TrafficService } from './traffic.service';
 import { AdminProcedureDraftsController } from './admin-procedures.controller';
 import { ProceduresModule } from '../procedures/procedures.module';
+import { AdminPipelineModule } from './pipeline/admin-pipeline.module';
 
 @Module({
   imports: [
     PgModule, // gives TrafficController access to TrafficRepository
     AiModule,
-    ProceduresModule
+    ProceduresModule,
+    AdminPipelineModule,
   ],
   controllers: [
     AiUsageAdminController,
     TrafficController,
-    AdminProcedureDraftsController
+    AdminProcedureDraftsController,
   ],
-  providers: [
-    AiUsageService,
-    TrafficService,
-  ],
+  providers: [AiUsageService, TrafficService],
 })
 export class AdminModule {}
