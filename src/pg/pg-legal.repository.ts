@@ -72,33 +72,32 @@ export class PgLegalRepository {
   // ---------------------------
 
   /**
-   * Returns registry docs that are worth trying to ingest.
+   * Returns registry docs that are ready for ingestion:
+   * - expected=true
+   * - scraped=true (parsed JSON should exist)
+   * - embedded=false (pending embed)
    *
-   * IMPORTANT: do NOT require scraped=true yet, because right now you are not
-   * writing scraped=true anywhere. We’ll wire that later from the scraper.
+   * We intentionally DO NOT include "has error" rows unless you want retries.
+   * If you want to include them, remove the last_error predicate.
    */
   async listRegistryToIngest(limit = 1): Promise<LawRegistryRow[]> {
+    const n = Math.max(1, Number(limit || 1));
+
     const sql = `
       SELECT ldoc_id, title, source_url, last_content_hash
       FROM law_registry
       WHERE expected = true
-        AND (
-          ingested = false
-          OR embedded = false
-          OR last_ingested_at IS NULL
-          OR last_error IS NOT NULL
-        )
+        AND scraped = true
+        AND embedded = false
       ORDER BY
-        -- brand new first
-        (CASE WHEN last_ingested_at IS NULL THEN 0 ELSE 1 END) ASC,
-        -- retry oldest ingested first (so we eventually cover everything)
-        last_ingested_at ASC NULLS FIRST,
-        -- stable tiebreaker
+        -- oldest ingested first (or never ingested)
+        COALESCE(last_ingested_at, to_timestamp(0)) ASC,
+        -- stable tie-break
         ldoc_id ASC
       LIMIT $1;
     `;
 
-    const res = await this.pool.query<LawRegistryRow>(sql, [limit]);
+    const res = await this.pool.query<LawRegistryRow>(sql, [n]);
     return res.rows;
   }
 
@@ -122,7 +121,10 @@ export class PgLegalRepository {
     await this.pool.query(
       `
       UPDATE law_registry
-      SET last_error = $2,
+      SET
+          ingested = false,
+          embedded = false,
+          last_error = $2,
           updated_at = now()
       WHERE ldoc_id = $1;
       `,
